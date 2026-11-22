@@ -89,7 +89,7 @@ class SshTunnelClient(
                 created.setConfig("compression.c2s", "none")
                 created.setServerAliveInterval(15_000)
                 created.setServerAliveCountMax(3)
-                created.setTimeout(15_000)
+                created.setTimeout(30_000)
                 created.setSocketFactory(ProtectedSocketFactory(vpnService, timeoutMs) { rtt ->
                     lastTcpConnectMs = rtt
                 })

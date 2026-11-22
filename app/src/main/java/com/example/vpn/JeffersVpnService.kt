@@ -168,10 +168,17 @@ class JeffersVpnService : VpnService() {
 
         val isSshMode = protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22
         val sshUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val cleanProfilePass = profile.password.trim()
+        val isDefaultVpsBhttpToken = profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
+            cleanProfilePass == VpnRepository.DEFAULT_VPS_PASSWORD &&
+            sshUser == VpnRepository.DEFAULT_SSH_USER
         val sshCandidatePasswords = buildList {
-            if (profile.password.isNotBlank()) add(profile.password.trim())
+            if (isDefaultVpsBhttpToken) {
+                add(VpnRepository.DEFAULT_SSH_PASSWORD)
+            }
+            if (cleanProfilePass.isNotBlank()) add(cleanProfilePass)
             if (profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
-                profile.password.trim() != VpnRepository.DEFAULT_SSH_PASSWORD
+                cleanProfilePass != VpnRepository.DEFAULT_SSH_PASSWORD
             ) {
                 add(VpnRepository.DEFAULT_SSH_PASSWORD)
             }
@@ -254,7 +261,7 @@ class JeffersVpnService : VpnService() {
             }
 
             try {
-                socket.soTimeout = 4000
+                socket.soTimeout = 1800
                 val out = socket.getOutputStream()
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val compiledPayload = BhttpPayloadBuilder.compile(profile)
@@ -315,6 +322,8 @@ class JeffersVpnService : VpnService() {
                 .setMtu(activeMtu)
                 .addAddress("10.8.0.2", 32)
                 .addRoute("0.0.0.0", 0)
+                .addAddress("fd00:10:8::2", 128)
+                .addRoute("::", 0)
                 .addDnsServer(activeDnsPrimary)
                 .addDnsServer(activeDnsSecondary)
 

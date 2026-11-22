@@ -128,6 +128,387 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun `jsch ssh client initializes session with expected algorithms and config`() {
+        val jsch = com.jcraft.jsch.JSch()
+        val session = jsch.getSession("root", "192.6.154.212", 22)
+        session.setConfig("StrictHostKeyChecking", "no")
+        session.setConfig("PreferredAuthentications", "password,keyboard-interactive")
+        session.setConfig("PubkeyAuthentication", "no")
+        assertEquals("no", session.getConfig("StrictHostKeyChecking"))
+        assertTrue(com.jcraft.jsch.JSch.getConfig("kex").contains("ecdh-sha2-nistp256"))
+        assertTrue(com.jcraft.jsch.JSch.getConfig("server_host_key").contains("rsa-sha2-512"))
+    }
+
+    private class PacketQueueInputStream(
+        private val queue: java.util.concurrent.LinkedBlockingQueue<ByteArray>
+    ) : java.io.InputStream() {
+        override fun read(): Int = throw UnsupportedOperationException("Packet-based read only")
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val pkt = queue.take()
+            if (pkt.isEmpty()) return -1
+            val copyLen = pkt.size.coerceAtMost(len)
+            System.arraycopy(pkt, 0, b, off, copyLen)
+            return copyLen
+        }
+    }
+
+    private class PacketQueueOutputStream(
+        private val queue: java.util.concurrent.LinkedBlockingQueue<ByteArray>
+    ) : java.io.OutputStream() {
+        override fun write(b: Int) = Unit
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            queue.offer(b.copyOfRange(off, off + len))
+        }
+    }
+
+    private fun readBeUShort(data: ByteArray, offset: Int): Int =
+        ((data[offset].toInt() and 0xFF) shl 8) or (data[offset + 1].toInt() and 0xFF)
+
+    private fun readBeUInt(data: ByteArray, offset: Int): Long =
+        ((data[offset].toLong() and 0xFF) shl 24) or
+            ((data[offset + 1].toLong() and 0xFF) shl 16) or
+            ((data[offset + 2].toLong() and 0xFF) shl 8) or
+            (data[offset + 3].toLong() and 0xFF)
+
+    @Test
+    fun `tunPacketRelay relays real TCP HTTP session, deduplicates SYN retry, and resets orphan packets`() {
+        val httpServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val serverPort = httpServer.localPort
+        val serverThread = thread(start = true) {
+            try {
+                val client = httpServer.accept()
+                client.soTimeout = 3000
+                val reader = client.getInputStream().bufferedReader()
+                val firstLine = reader.readLine()
+                if (firstLine?.startsWith("GET /ping") == true) {
+                    client.getOutputStream().write(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nPONG".toByteArray(Charsets.UTF_8)
+                    )
+                    client.getOutputStream().flush()
+                }
+                client.close()
+            } catch (_: Exception) {
+            }
+        }
+
+        val tunToRelay = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayToTun = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
+
+        val relay = TunPacketRelay(
+            protectSocket = { true },
+            protectDatagramSocket = { true },
+            tunInputProvider = { PacketQueueInputStream(tunToRelay) },
+            tunOutputProvider = { PacketQueueOutputStream(relayToTun) },
+            dnsPrimaryIp = "127.0.0.1",
+            dnsSecondaryIp = "127.0.0.1",
+            vpsHost = "",
+            vpsPort = 0,
+            vpsUsername = "root",
+            vpsPassword = "",
+            sshCandidatePasswords = emptyList(),
+            initialSshClient = null,
+            scope = relayScope,
+            mtu = 1400,
+            sshClientFactory = null,
+            onLog = { _, _, _ -> },
+            onStatusMessage = {}
+        )
+
+        val relayThread = thread(start = true) { relay.runLoop() }
+
+        try {
+            val clientIp = byteArrayOf(10, 8, 0, 2)
+            val serverIp = byteArrayOf(127, 0, 0, 1)
+            val clientPort = 54321
+            val clientIsn = 10000L
+
+            // 1. Send orphan non-SYN ACK -> expect immediate TCP RST
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = clientIp,
+                    dstIp = serverIp,
+                    srcPort = clientPort - 1,
+                    dstPort = serverPort,
+                    seqNum = 500L,
+                    ackNum = 999L,
+                    flags = 0x10,
+                    payload = ByteArray(0)
+                )
+            )
+            val orphanRst = relayToTun.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull("Expected immediate RST for orphan non-SYN packet", orphanRst)
+            orphanRst!!
+            assertEquals(0x04, orphanRst[33].toInt() and 0x3F)
+            assertEquals(999L, readBeUInt(orphanRst, 24))
+
+            // 2. Send SYN + duplicate SYN retransmit -> only one session, second gets resent SYN+ACK
+            val synPacket = TunPacketRelay.buildIpv4TcpPacket(
+                srcIp = clientIp,
+                dstIp = serverIp,
+                srcPort = clientPort,
+                dstPort = serverPort,
+                seqNum = clientIsn,
+                ackNum = 0L,
+                flags = 0x02,
+                payload = ByteArray(0)
+            )
+            tunToRelay.offer(synPacket)
+
+            val synAck = relayToTun.poll(3, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull("Expected SYN+ACK from relay", synAck)
+            synAck!!
+            assertEquals(0x12, synAck[33].toInt() and 0x3F)
+            assertEquals(clientIsn + 1L, readBeUInt(synAck, 28))
+            val serverIsn = readBeUInt(synAck, 24)
+
+            // Retransmitted SYN must resend SYN+ACK with same serverIsn instead of killing session
+            tunToRelay.offer(synPacket)
+            val dupSynAck = relayToTun.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull(dupSynAck)
+            assertEquals(serverIsn, readBeUInt(dupSynAck!!, 24))
+
+            // 3. Send ACK + HTTP GET request
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = clientIp,
+                    dstIp = serverIp,
+                    srcPort = clientPort,
+                    dstPort = serverPort,
+                    seqNum = clientIsn + 1L,
+                    ackNum = serverIsn + 1L,
+                    flags = 0x10,
+                    payload = ByteArray(0)
+                )
+            )
+            val httpGet = "GET /ping HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(Charsets.UTF_8)
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = clientIp,
+                    dstIp = serverIp,
+                    srcPort = clientPort,
+                    dstPort = serverPort,
+                    seqNum = clientIsn + 1L,
+                    ackNum = serverIsn + 1L,
+                    flags = 0x18,
+                    payload = httpGet
+                )
+            )
+
+            val receivedBody = StringBuilder()
+            var sawAck = false
+            var sawFin = false
+            val deadline = System.currentTimeMillis() + 4000L
+            while (System.currentTimeMillis() < deadline && (!sawFin || !receivedBody.contains("PONG"))) {
+                val pkt = relayToTun.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                assertEquals(0, onesComplementSum(pkt, 0, 20))
+                val ihl = (pkt[0].toInt() and 0x0F) * 4
+                val dataOff = ((pkt[ihl + 12].toInt() ushr 4) and 0x0F) * 4
+                val flags = pkt[ihl + 13].toInt() and 0x3F
+                val headerEnd = ihl + dataOff
+                if ((flags and 0x10) != 0 && readBeUInt(pkt, ihl + 8) == clientIsn + 1L + httpGet.size) {
+                    sawAck = true
+                }
+                if (pkt.size > headerEnd) {
+                    receivedBody.append(String(pkt, headerEnd, pkt.size - headerEnd, Charsets.UTF_8))
+                }
+                if ((flags and 0x01) != 0) {
+                    sawFin = true
+                }
+            }
+
+            assertTrue("Expected ACK for HTTP GET", sawAck)
+            assertTrue("Expected HTTP 200 PONG response, got: $receivedBody", receivedBody.contains("HTTP/1.1 200 OK") && receivedBody.contains("PONG"))
+            assertTrue("Expected FIN+ACK on server close", sawFin)
+        } finally {
+            tunToRelay.offer(ByteArray(0))
+            relay.closeAllSessions()
+            relayScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            try { httpServer.close() } catch (_: Exception) {}
+            serverThread.join(1000)
+            relayThread.join(1000)
+        }
+    }
+
+    @Test
+    fun `tunPacketRelay routes TCP through HTTP CONNECT proxy and rejects IPv6 packets immediately`() {
+        val targetServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val targetPort = targetServer.localPort
+        val targetThread = thread(start = true) {
+            try {
+                val client = targetServer.accept()
+                client.soTimeout = 2000
+                val line = client.getInputStream().bufferedReader().readLine()
+                if (line?.contains("GET /proxy-ok") == true) {
+                    client.getOutputStream().write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".toByteArray())
+                    client.getOutputStream().flush()
+                }
+                client.close()
+            } catch (_: Exception) {
+            }
+        }
+
+        val proxyServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val proxyPort = proxyServer.localPort
+        val proxyThread = thread(start = true) {
+            try {
+                while (!proxyServer.isClosed) {
+                    val client = proxyServer.accept()
+                    thread(start = true) {
+                        try {
+                            client.soTimeout = 3000
+                            val inStream = client.getInputStream()
+                            val headerBuf = ByteArray(2048)
+                            var hLen = 0
+                            while (hLen < headerBuf.size) {
+                                val b = inStream.read()
+                                if (b < 0) break
+                                headerBuf[hLen++] = b.toByte()
+                                if (hLen >= 4 &&
+                                    headerBuf[hLen - 4] == '\r'.code.toByte() &&
+                                    headerBuf[hLen - 3] == '\n'.code.toByte() &&
+                                    headerBuf[hLen - 2] == '\r'.code.toByte() &&
+                                    headerBuf[hLen - 1] == '\n'.code.toByte()
+                                ) break
+                            }
+                            val reqText = String(headerBuf, 0, hLen, Charsets.UTF_8)
+                            val firstLine = reqText.lineSequence().firstOrNull().orEmpty()
+                            if (firstLine.startsWith("CONNECT ")) {
+                                val hostPort = firstLine.removePrefix("CONNECT ").substringBefore(" ")
+                                val dstPort = hostPort.substringAfter(":").toIntOrNull() ?: 0
+                                if (dstPort == targetPort) {
+                                    val upstream = java.net.Socket("127.0.0.1", targetPort)
+                                    client.getOutputStream().write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                    val t1 = thread(start = true) {
+                                        try { inStream.copyTo(upstream.getOutputStream()) } catch (_: Exception) {} finally {
+                                            try { upstream.shutdownOutput() } catch (_: Exception) {}
+                                        }
+                                    }
+                                    try { upstream.getInputStream().copyTo(client.getOutputStream()) } catch (_: Exception) {}
+                                    t1.join(1000)
+                                    upstream.close()
+                                } else {
+                                    client.getOutputStream().write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                }
+                            }
+                            client.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val tunToRelay = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayToTun = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
+
+        val relay = TunPacketRelay(
+            protectSocket = { true },
+            protectDatagramSocket = { true },
+            tunInputProvider = { PacketQueueInputStream(tunToRelay) },
+            tunOutputProvider = { PacketQueueOutputStream(relayToTun) },
+            dnsPrimaryIp = "127.0.0.1",
+            dnsSecondaryIp = "127.0.0.1",
+            vpsHost = "127.0.0.1",
+            vpsPort = proxyPort,
+            vpsUsername = "root",
+            vpsPassword = "secret",
+            sshCandidatePasswords = emptyList(),
+            initialSshClient = null,
+            scope = relayScope,
+            mtu = 1400,
+            sshClientFactory = null,
+            onLog = { _, _, _ -> },
+            onStatusMessage = {}
+        )
+        val relayThread = thread(start = true) { relay.runLoop() }
+
+        try {
+            // 1. Feed IPv6 TCP SYN & IPv6 UDP directly through relay loop and verify immediate rejection
+            val srcV6 = ByteArray(16).apply { this[0] = 0xfd.toByte(); this[15] = 2 }
+            val dstV6 = ByteArray(16).apply { this[0] = 0x26; this[1] = 0x06; this[15] = 1 }
+            val ipv6Syn = java.nio.ByteBuffer.allocate(60).apply {
+                putInt(0x60000000); putShort(20.toShort()); put(6.toByte()); put(64.toByte())
+                put(srcV6); put(dstV6)
+                putShort(44444.toShort()); putShort(443.toShort()); putInt(12345); putInt(0)
+                put((5 shl 4).toByte()); put(0x02.toByte()); putShort(65535.toShort()); putShort(0.toShort()); putShort(0.toShort())
+            }.array()
+            tunToRelay.offer(ipv6Syn)
+            val rstV6 = relayToTun.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull(rstV6)
+            assertEquals(6, rstV6!![6].toInt() and 0xFF)
+            assertEquals(0x14, rstV6[53].toInt() and 0x3F)
+            assertEquals(44444, readBeUShort(rstV6, 42))
+
+            val ipv6Udp = java.nio.ByteBuffer.allocate(52).apply {
+                putInt(0x60000000); putShort(12.toShort()); put(17.toByte()); put(64.toByte())
+                put(srcV6); put(dstV6)
+                putShort(51234.toShort()); putShort(443.toShort()); putShort(12.toShort()); putShort(0.toShort()); putInt(0x01020304)
+            }.array()
+            tunToRelay.offer(ipv6Udp)
+            val icmpV6 = relayToTun.poll(2, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull(icmpV6)
+            assertEquals(58, icmpV6!![6].toInt() and 0xFF)
+            assertEquals(1, icmpV6[40].toInt() and 0xFF)
+            assertEquals(4, icmpV6[41].toInt() and 0xFF)
+
+            // 2. Now open an IPv4 TCP connection and verify it tunnels through HTTP CONNECT proxy
+            val clientIp = byteArrayOf(10, 8, 0, 2)
+            val dstIp = byteArrayOf(127, 0, 0, 1)
+            val clientPort = 55123
+            val clientIsn = 20000L
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = clientIp, dstIp = dstIp, srcPort = clientPort, dstPort = targetPort,
+                    seqNum = clientIsn, ackNum = 0L, flags = 0x02, payload = ByteArray(0)
+                )
+            )
+            val synAck = relayToTun.poll(3, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull("Expected SYN+ACK via HTTP CONNECT proxy", synAck)
+            val serverIsn = readBeUInt(synAck!!, 24)
+
+            val httpGet = "GET /proxy-ok HTTP/1.1\r\nHost: localhost\r\n\r\n".toByteArray(Charsets.UTF_8)
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = clientIp, dstIp = dstIp, srcPort = clientPort, dstPort = targetPort,
+                    seqNum = clientIsn + 1L, ackNum = serverIsn + 1L, flags = 0x18, payload = httpGet
+                )
+            )
+
+            val responseText = StringBuilder()
+            val deadline = System.currentTimeMillis() + 4000L
+            while (System.currentTimeMillis() < deadline && !responseText.contains("OK\r\n") && !responseText.endsWith("OK")) {
+                val pkt = relayToTun.poll(500, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
+                if ((pkt[0].toInt() ushr 4) != 4 || (pkt[9].toInt() and 0xFF) != 6) continue
+                val ihl = (pkt[0].toInt() and 0x0F) * 4
+                val dataOff = ((pkt[ihl + 12].toInt() ushr 4) and 0x0F) * 4
+                val hdrEnd = ihl + dataOff
+                if (pkt.size > hdrEnd) {
+                    responseText.append(String(pkt, hdrEnd, pkt.size - hdrEnd, Charsets.UTF_8))
+                }
+            }
+            assertTrue("Expected HTTP 200 OK through proxy, got: $responseText", responseText.contains("HTTP/1.1 200 OK") && responseText.contains("OK"))
+        } finally {
+            tunToRelay.offer(ByteArray(0))
+            relay.closeAllSessions()
+            relayScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            try { proxyServer.close() } catch (_: Exception) {}
+            try { targetServer.close() } catch (_: Exception) {}
+            targetThread.join(1000)
+            proxyThread.join(1000)
+            relayThread.join(1000)
+        }
+    }
+
+    @Test
     fun `admin password verification succeeds for default ultra-hard password and rejects wrong input`() {
         val ultraDefault = "Jv#8Qx!4Lp@9Zr%2Km&7Tn*5W^3B"
         val hash = LicenseCodeEngine.hashAdminPassword(ultraDefault)
