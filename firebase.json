@@ -1,0 +1,12 @@
+{
+  "firestore": {
+    "database": "ai-studio-android-jeffersv-815ce2ff-3ee1-4904-acb8-c0856917ca5f",
+    "rules": "firestore.rules"
+  },
+  "emulators": {
+    "firestore": {
+      "host": "127.0.0.1",
+      "port": 8085
+    }
+  }
+}

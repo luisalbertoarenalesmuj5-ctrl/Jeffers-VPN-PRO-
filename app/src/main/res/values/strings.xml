@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">Jeffers VPN</string>
+    <string name="nav_connect">Conexión</string>
+    <string name="nav_servers">Servidores</string>
+    <string name="nav_logs">Registros</string>
+    <string name="status_disconnected">DESCONECTADO</string>
+    <string name="status_connecting">CONECTANDO…</string>
+    <string name="status_connected">CONECTADO</string>
+    <string name="status_error">ERROR DE CONEXIÓN</string>
+    <string name="action_connect">Conectar VPN</string>
+    <string name="action_disconnect">Desconectar VPN</string>
+    <string name="action_test_ping">Probar VPS</string>
+    <string name="action_new_profile">Nuevo Perfil</string>
+    <string name="vpn_notification_channel_name">Estado de Jeffers VPN</string>
+    <string name="vpn_notification_channel_desc">Muestra el estado activo del túnel BHTTP</string>
+    <string name="vpn_notification_title">Jeffers VPN activo</string>
+</resources>

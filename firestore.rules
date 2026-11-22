@@ -1,0 +1,267 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isVerifiedAdminEmail() {
+      return isSignedIn() &&
+        request.auth.token.email_verified == true &&
+        request.auth.token.email == 'luisalbertoarenalesmuj5@gmail.com';
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isVerifiedAdminEmail() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidDocId(docId) {
+      return docId is string &&
+        docId.size() >= 4 &&
+        docId.size() <= 80 &&
+        docId.matches('^[A-Za-z0-9._-]+$');
+    }
+
+    function isValidUsernameId(usernameKey) {
+      return usernameKey is string &&
+        usernameKey.size() >= 3 &&
+        usernameKey.size() <= 40 &&
+        usernameKey.matches('^[a-z0-9._-]+$');
+    }
+
+    function isValidTier(tier) {
+      return tier in ['FREE', 'PRO', 'VIP', 'PREMIUM', 'SUPER_PRO'];
+    }
+
+    function isValidAdminUser(data) {
+      return data.keys().hasAll(['email', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['email', 'role', 'createdAt']) &&
+        data.email is string &&
+        data.email.size() >= 5 &&
+        data.email.size() <= 160 &&
+        data.role == 'admin' &&
+        data.createdAt is timestamp &&
+        data.createdAt <= request.time;
+    }
+
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll([
+          'uid', 'displayName', 'userCountry', 'deviceId',
+          'activeTier', 'activationCode', 'expiresAtMillis', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'userCountry', 'deviceId',
+          'activeTier', 'activationCode', 'expiresAtMillis', 'createdAt', 'updatedAt'
+        ]) &&
+        data.uid == userId &&
+        (!('email' in data) || (data.email is string && data.email.size() <= 160)) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.userCountry is string && data.userCountry.size() >= 1 && data.userCountry.size() <= 40 &&
+        data.deviceId is string && data.deviceId.size() >= 4 && data.deviceId.size() <= 64 &&
+        isValidTier(data.activeTier) &&
+        data.activationCode is string && data.activationCode.size() <= 80 &&
+        data.expiresAtMillis is int && data.expiresAtMillis >= 0 &&
+        data.createdAt is timestamp && data.createdAt <= request.time &&
+        data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidDeviceLicense(data, deviceId) {
+      return isValidDocId(deviceId) &&
+        data.keys().hasAll([
+          'deviceId', 'code', 'tier', 'durationDays', 'expiresAtMillis',
+          'revoked', 'note', 'issuerUid', 'activatedAtMillis', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'deviceId', 'code', 'tier', 'durationDays', 'expiresAtMillis',
+          'revoked', 'note', 'issuerUid', 'claimedByUid', 'activatedAtMillis',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.deviceId == deviceId &&
+        data.code is string && data.code.size() >= 6 && data.code.size() <= 80 &&
+        isValidTier(data.tier) &&
+        data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 3650 &&
+        data.expiresAtMillis is int && data.expiresAtMillis > 0 &&
+        data.revoked is bool &&
+        data.note is string && data.note.size() <= 120 &&
+        data.issuerUid is string && data.issuerUid.size() >= 1 && data.issuerUid.size() <= 128 &&
+        (!('claimedByUid' in data) || (data.claimedByUid is string && data.claimedByUid.size() >= 1 && data.claimedByUid.size() <= 128)) &&
+        data.activatedAtMillis is int && data.activatedAtMillis >= 0 &&
+        data.createdAt is timestamp && data.createdAt <= request.time &&
+        data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidLicenseCode(data, codeKey) {
+      return isValidDocId(codeKey) &&
+        data.keys().hasAll([
+          'code', 'tier', 'durationDays', 'expiresAtMillis',
+          'revoked', 'note', 'issuerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'code', 'tier', 'durationDays', 'expiresAtMillis', 'boundDeviceId',
+          'revoked', 'note', 'issuerUid', 'claimedByUid', 'activatedByDeviceId',
+          'activatedAtMillis', 'createdAt', 'updatedAt'
+        ]) &&
+        data.code == codeKey &&
+        isValidTier(data.tier) &&
+        data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 3650 &&
+        data.expiresAtMillis is int && data.expiresAtMillis > 0 &&
+        (!('boundDeviceId' in data) || (data.boundDeviceId is string && data.boundDeviceId.size() <= 64)) &&
+        data.revoked is bool &&
+        data.note is string && data.note.size() <= 120 &&
+        data.issuerUid is string && data.issuerUid.size() >= 1 && data.issuerUid.size() <= 128 &&
+        (!('claimedByUid' in data) || (data.claimedByUid is string && data.claimedByUid.size() >= 1 && data.claimedByUid.size() <= 128)) &&
+        (!('activatedByDeviceId' in data) || (data.activatedByDeviceId is string && data.activatedByDeviceId.size() <= 64)) &&
+        (!('activatedAtMillis' in data) || (data.activatedAtMillis is int && data.activatedAtMillis >= 0)) &&
+        data.createdAt is timestamp && data.createdAt <= request.time &&
+        data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    function isValidPersonalClient(data, usernameKey) {
+      return isValidUsernameId(usernameKey) &&
+        data.keys().hasAll([
+          'usernameKey', 'displayUsername', 'code', 'tier', 'durationDays',
+          'expiresAtMillis', 'hasPassword', 'passwordHash', 'revoked',
+          'note', 'issuerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'usernameKey', 'displayUsername', 'code', 'tier', 'durationDays',
+          'expiresAtMillis', 'hasPassword', 'passwordHash', 'boundDeviceId', 'revoked',
+          'note', 'issuerUid', 'claimedByUid', 'activatedByDeviceId',
+          'activatedAtMillis', 'createdAt', 'updatedAt'
+        ]) &&
+        data.usernameKey == usernameKey &&
+        data.displayUsername is string && data.displayUsername.size() >= 3 && data.displayUsername.size() <= 40 &&
+        data.code is string && data.code.size() >= 6 && data.code.size() <= 80 &&
+        isValidTier(data.tier) &&
+        data.durationDays is int && data.durationDays >= 1 && data.durationDays <= 3650 &&
+        data.expiresAtMillis is int && data.expiresAtMillis > 0 &&
+        data.hasPassword is bool &&
+        data.passwordHash is string && data.passwordHash.size() <= 128 &&
+        (!('boundDeviceId' in data) || (data.boundDeviceId is string && data.boundDeviceId.size() <= 64)) &&
+        data.revoked is bool &&
+        data.note is string && data.note.size() <= 120 &&
+        data.issuerUid is string && data.issuerUid.size() >= 1 && data.issuerUid.size() <= 128 &&
+        (!('claimedByUid' in data) || (data.claimedByUid is string && data.claimedByUid.size() >= 1 && data.claimedByUid.size() <= 128)) &&
+        (!('activatedByDeviceId' in data) || (data.activatedByDeviceId is string && data.activatedByDeviceId.size() <= 64)) &&
+        (!('activatedAtMillis' in data) || (data.activatedAtMillis is int && data.activatedAtMillis >= 0)) &&
+        data.createdAt is timestamp && data.createdAt <= request.time &&
+        data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    match /admins/{userId} {
+      allow get: if isOwner(userId);
+      allow list: if isAdmin();
+      allow create: if isOwner(userId) && isVerifiedAdminEmail() && isValidAdminUser(request.resource.data);
+      allow update, delete: if false;
+    }
+
+    match /users/{userId} {
+      allow get, list: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUserAccount(request.resource.data, userId);
+      allow update: if isOwner(userId) &&
+        isValidUserAccount(request.resource.data, userId) &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'email', 'displayName', 'userCountry', 'deviceId',
+          'activeTier', 'activationCode', 'expiresAtMillis', 'updatedAt'
+        ]);
+      allow delete: if isOwner(userId) || isAdmin();
+    }
+
+    match /device_licenses/{deviceId} {
+      allow get: if isSignedIn() && isValidDocId(deviceId);
+      allow list: if isAdmin() || (isSignedIn() && resource.data.claimedByUid == request.auth.uid);
+      allow create: if isAdmin() && isValidDeviceLicense(request.resource.data, deviceId);
+      allow update: if (
+          isAdmin() &&
+          isValidDeviceLicense(request.resource.data, deviceId) &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          request.resource.data.deviceId == resource.data.deviceId
+        ) || (
+          isSignedIn() &&
+          isValidDocId(deviceId) &&
+          resource.data.revoked == false &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'claimedByUid', 'activatedAtMillis', 'updatedAt'
+          ]) &&
+          (!('claimedByUid' in resource.data) || resource.data.claimedByUid == null || resource.data.claimedByUid == request.auth.uid) &&
+          request.resource.data.claimedByUid == request.auth.uid &&
+          request.resource.data.activatedAtMillis is int &&
+          request.resource.data.activatedAtMillis >= 0 &&
+          request.resource.data.updatedAt is timestamp &&
+          request.resource.data.updatedAt <= request.time
+        );
+      allow delete: if isAdmin();
+    }
+
+    match /license_codes/{codeKey} {
+      allow get: if isSignedIn() && isValidDocId(codeKey);
+      allow list: if isAdmin() || (isSignedIn() && resource.data.claimedByUid == request.auth.uid);
+      allow create: if isAdmin() && isValidLicenseCode(request.resource.data, codeKey);
+      allow update: if (
+          isAdmin() &&
+          isValidLicenseCode(request.resource.data, codeKey) &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          request.resource.data.code == resource.data.code
+        ) || (
+          isSignedIn() &&
+          isValidDocId(codeKey) &&
+          resource.data.revoked == false &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'claimedByUid', 'activatedByDeviceId', 'activatedAtMillis', 'updatedAt'
+          ]) &&
+          (!('claimedByUid' in resource.data) || resource.data.claimedByUid == null || resource.data.claimedByUid == request.auth.uid) &&
+          request.resource.data.claimedByUid == request.auth.uid &&
+          request.resource.data.activatedByDeviceId is string &&
+          request.resource.data.activatedByDeviceId.size() >= 4 &&
+          request.resource.data.activatedByDeviceId.size() <= 64 &&
+          request.resource.data.activatedAtMillis is int &&
+          request.resource.data.activatedAtMillis >= 0 &&
+          request.resource.data.updatedAt is timestamp &&
+          request.resource.data.updatedAt <= request.time
+        );
+      allow delete: if isAdmin();
+    }
+
+    match /personal_clients/{usernameKey} {
+      allow get: if isSignedIn() && isValidUsernameId(usernameKey);
+      allow list: if isAdmin() || (isSignedIn() && resource.data.claimedByUid == request.auth.uid);
+      allow create: if isAdmin() && isValidPersonalClient(request.resource.data, usernameKey);
+      allow update: if (
+          isAdmin() &&
+          isValidPersonalClient(request.resource.data, usernameKey) &&
+          request.resource.data.createdAt == resource.data.createdAt &&
+          request.resource.data.usernameKey == resource.data.usernameKey
+        ) || (
+          isSignedIn() &&
+          isValidUsernameId(usernameKey) &&
+          resource.data.revoked == false &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'claimedByUid', 'activatedByDeviceId', 'activatedAtMillis', 'updatedAt'
+          ]) &&
+          (!('claimedByUid' in resource.data) || resource.data.claimedByUid == null || resource.data.claimedByUid == request.auth.uid) &&
+          request.resource.data.claimedByUid == request.auth.uid &&
+          request.resource.data.activatedByDeviceId is string &&
+          request.resource.data.activatedByDeviceId.size() >= 4 &&
+          request.resource.data.activatedByDeviceId.size() <= 64 &&
+          request.resource.data.activatedAtMillis is int &&
+          request.resource.data.activatedAtMillis >= 0 &&
+          request.resource.data.updatedAt is timestamp &&
+          request.resource.data.updatedAt <= request.time
+        );
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Jeffers VPN",
+  "description": "Cliente VPN profesional con soporte de protocolo BHTTP para VPSpremiumPRO y perfiles Tigo/Claro.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

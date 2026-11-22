@@ -1,0 +1,341 @@
+{
+  "entities": {
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Authorized cloud administrator profile bound to Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Verified administrator Google email."
+        },
+        "role": {
+          "type": "string",
+          "description": "Fixed role marker ('admin')."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        }
+      },
+      "required": ["email", "role", "createdAt"]
+    },
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Signed-in Jeffers VPN user profile and current active plan metadata.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID matching document ID."
+        },
+        "email": {
+          "type": "string",
+          "description": "Google account email."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "User alias shown in Profile."
+        },
+        "userCountry": {
+          "type": "string",
+          "description": "CountryRegion enum name."
+        },
+        "deviceId": {
+          "type": "string",
+          "description": "User device ID used for ID-based plan activation."
+        },
+        "activeTier": {
+          "type": "string",
+          "description": "PlanTier name (FREE, PRO, VIP, PREMIUM, SUPER_PRO)."
+        },
+        "activationCode": {
+          "type": "string",
+          "description": "Active license code if any."
+        },
+        "expiresAtMillis": {
+          "type": "integer",
+          "description": "Subscription expiration epoch in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "userCountry",
+        "deviceId",
+        "activeTier",
+        "activationCode",
+        "expiresAtMillis",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DeviceLicense": {
+      "title": "DeviceLicense",
+      "description": "Cross-device plan license assigned directly to a target Device ID (zero PII).",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "description": "Normalized lowercase target Device ID matching document ID."
+        },
+        "code": {
+          "type": "string",
+          "description": "Signed JFF license code."
+        },
+        "tier": {
+          "type": "string",
+          "description": "PlanTier name (FREE, PRO, VIP, PREMIUM, SUPER_PRO)."
+        },
+        "durationDays": {
+          "type": "integer",
+          "description": "Subscription duration in days."
+        },
+        "expiresAtMillis": {
+          "type": "integer",
+          "description": "Expiration timestamp in epoch milliseconds."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "True if revoked by admin."
+        },
+        "note": {
+          "type": "string",
+          "description": "Admin reference note."
+        },
+        "issuerUid": {
+          "type": "string",
+          "description": "Admin UID that issued this license."
+        },
+        "claimedByUid": {
+          "type": "string",
+          "description": "Optional UID of the device owner who claimed the license."
+        },
+        "activatedAtMillis": {
+          "type": "integer",
+          "description": "Activation epoch in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "deviceId",
+        "code",
+        "tier",
+        "durationDays",
+        "expiresAtMillis",
+        "revoked",
+        "note",
+        "issuerUid",
+        "activatedAtMillis",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "LicenseCode": {
+      "title": "LicenseCode",
+      "description": "Admin-issued JFF subscription code synchronized for cloud validation and revocation.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Uppercase license code matching document ID."
+        },
+        "tier": {
+          "type": "string",
+          "description": "PlanTier name."
+        },
+        "durationDays": {
+          "type": "integer",
+          "description": "Subscription duration in days."
+        },
+        "expiresAtMillis": {
+          "type": "integer",
+          "description": "Expiration epoch in milliseconds."
+        },
+        "boundDeviceId": {
+          "type": "string",
+          "description": "Optional bound device ID."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "True if revoked by admin."
+        },
+        "note": {
+          "type": "string",
+          "description": "Admin note."
+        },
+        "issuerUid": {
+          "type": "string",
+          "description": "Admin UID."
+        },
+        "claimedByUid": {
+          "type": "string",
+          "description": "UID of customer who redeemed the code."
+        },
+        "activatedByDeviceId": {
+          "type": "string",
+          "description": "Device ID that redeemed the code."
+        },
+        "activatedAtMillis": {
+          "type": "integer",
+          "description": "Activation epoch in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "code",
+        "tier",
+        "durationDays",
+        "expiresAtMillis",
+        "revoked",
+        "note",
+        "issuerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PersonalClientLicense": {
+      "title": "PersonalClientLicense",
+      "description": "Personal client username subscription created by admin (stores salted SHA-256 verifier, never plaintext password).",
+      "type": "object",
+      "properties": {
+        "usernameKey": {
+          "type": "string",
+          "description": "Normalized lowercase username matching document ID."
+        },
+        "displayUsername": {
+          "type": "string",
+          "description": "Original display username."
+        },
+        "code": {
+          "type": "string",
+          "description": "Linked JFF subscription code."
+        },
+        "tier": {
+          "type": "string",
+          "description": "PlanTier name."
+        },
+        "durationDays": {
+          "type": "integer",
+          "description": "Subscription duration in days."
+        },
+        "expiresAtMillis": {
+          "type": "integer",
+          "description": "Expiration epoch in milliseconds."
+        },
+        "hasPassword": {
+          "type": "boolean",
+          "description": "Whether password verification is required."
+        },
+        "passwordHash": {
+          "type": "string",
+          "description": "SHA-256 salted verifier or empty string."
+        },
+        "boundDeviceId": {
+          "type": "string",
+          "description": "Optional bound device ID."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "True if revoked by admin."
+        },
+        "note": {
+          "type": "string",
+          "description": "Admin note."
+        },
+        "issuerUid": {
+          "type": "string",
+          "description": "Admin UID."
+        },
+        "claimedByUid": {
+          "type": "string",
+          "description": "UID of customer who activated this personal account."
+        },
+        "activatedByDeviceId": {
+          "type": "string",
+          "description": "Device ID that activated this account."
+        },
+        "activatedAtMillis": {
+          "type": "integer",
+          "description": "Activation epoch in milliseconds."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "usernameKey",
+        "displayUsername",
+        "code",
+        "tier",
+        "durationDays",
+        "expiresAtMillis",
+        "hasPassword",
+        "passwordHash",
+        "revoked",
+        "note",
+        "issuerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "Verified administrator lookup table keyed by Firebase Auth UID."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "User account preferences and active plan metadata owned by userId."
+    },
+    "/device_licenses/{deviceId}": {
+      "schema": { "$ref": "#/entities/DeviceLicense" },
+      "description": "Real-time cross-device licenses activated directly by Device ID."
+    },
+    "/license_codes/{codeKey}": {
+      "schema": { "$ref": "#/entities/LicenseCode" },
+      "description": "Cloud-synced JFF subscription codes generated by admin."
+    },
+    "/personal_clients/{usernameKey}": {
+      "schema": { "$ref": "#/entities/PersonalClientLicense" },
+      "description": "Personal client username licenses synchronized across devices."
+    }
+  }
+}
