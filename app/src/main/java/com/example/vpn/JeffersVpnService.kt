@@ -41,6 +41,7 @@ class JeffersVpnService : VpnService() {
     private var connectionJob: Job? = null
     private var tunInterface: ParcelFileDescriptor? = null
     private var controlSocket: Socket? = null
+    private var activeSshClient: SshTunnelClient? = null
     private var activeRelay: TunPacketRelay? = null
     private var sessionStartedAt: Long = 0L
     private var currentProfile: VpnProfileEntity? = null
@@ -165,66 +166,97 @@ class JeffersVpnService : VpnService() {
             LogLevel.INFO
         )
 
-        val socket = Socket()
-        controlSocket = socket
-        val pingMs: Int
-        try {
-            protect(socket)
-            socket.tcpNoDelay = true
-            socket.keepAlive = true
-            val startNs = System.nanoTime()
-            socket.connect(InetSocketAddress(profile.host, profile.port), 6000)
-            pingMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-            repository.updateLatency(profile.id, pingMs)
-            VpnStateHolder.appendLog(
-                "TCP",
-                "Conexión TCP establecida con ${profile.host}:${profile.port} (${pingMs} ms)",
-                LogLevel.SUCCESS
-            )
-        } catch (e: Exception) {
-            val errorDetail = e.localizedMessage ?: e.javaClass.simpleName
-            VpnStateHolder.appendLog(
-                "VPS",
-                "Sin respuesta de ${profile.host}:${profile.port} — $errorDetail",
-                LogLevel.ERROR
-            )
-            if (!engineSettings.autoReconnect) {
-                stopTunnel(
-                    status = VpnConnectionStatus.ERROR,
-                    message = "Sin respuesta de ${profile.host}:${profile.port} ($errorDetail)"
-                )
-            }
-            return false
-        }
-
         val isSshMode = protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22
+        val sshUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val sshCandidatePasswords = buildList {
+            if (profile.password.isNotBlank()) add(profile.password.trim())
+            if (profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
+                profile.password.trim() != VpnRepository.DEFAULT_SSH_PASSWORD
+            ) {
+                add(VpnRepository.DEFAULT_SSH_PASSWORD)
+            }
+        }.distinct()
+
+        var pingMs: Int
         var initialRxBytes = 0L
         var initialTxBytes = 0L
-        try {
-            socket.soTimeout = 4000
-            val out = socket.getOutputStream()
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+        var establishedSshClient: SshTunnelClient? = null
 
-            if (isSshMode) {
-                val sshBanner = try {
-                    reader.readLine()
-                } catch (_: Exception) {
-                    null
-                }
-                if (sshBanner != null) {
-                    initialRxBytes += sshBanner.toByteArray(Charsets.UTF_8).size
-                    VpnStateHolder.appendLog("SSH", "Servidor SSH: $sshBanner", LogLevel.SUCCESS)
-                }
-                val clientHello = "${BhttpPayloadBuilder.DEFAULT_SSH_CLIENT_ID}\r\n".toByteArray(Charsets.UTF_8)
-                out.write(clientHello)
-                out.flush()
-                initialTxBytes += clientHello.size.toLong()
+        if (isSshMode) {
+            VpnStateHolder.appendLog(
+                "SSH",
+                "Conectando sesión SSH ($sshUser@${profile.host}:${profile.port})…",
+                LogLevel.INFO
+            )
+            val sshClient = SshTunnelClient(
+                vpnService = this@JeffersVpnService,
+                host = profile.host,
+                port = profile.port,
+                username = sshUser,
+                candidatePasswords = sshCandidatePasswords
+            )
+            val connectResult = sshClient.connect(6000)
+            if (connectResult.isFailure) {
+                sshClient.disconnect()
+                val err = connectResult.exceptionOrNull()
+                val errorDetail = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Error SSH"
                 VpnStateHolder.appendLog(
                     "SSH",
-                    "Identificación SSH enviada • Usuario=${profile.username} • Puerto=${profile.port}",
-                    LogLevel.INFO
+                    "Error autenticando SSH en ${profile.host}:${profile.port}: $errorDetail",
+                    LogLevel.ERROR
                 )
-            } else {
+                if (!engineSettings.autoReconnect) {
+                    stopTunnel(
+                        status = VpnConnectionStatus.ERROR,
+                        message = "Fallo SSH en ${profile.host}:${profile.port} ($errorDetail)"
+                    )
+                }
+                return false
+            }
+            pingMs = connectResult.getOrDefault(1)
+            establishedSshClient = sshClient
+            activeSshClient = sshClient
+            VpnStateHolder.appendLog(
+                "SSH",
+                "Túnel SSH autenticado ($sshUser@${profile.host}:${profile.port} • ${pingMs} ms)",
+                LogLevel.SUCCESS
+            )
+        } else {
+            val socket = Socket()
+            controlSocket = socket
+            try {
+                protect(socket)
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                val startNs = System.nanoTime()
+                socket.connect(InetSocketAddress(profile.host, profile.port), 6000)
+                pingMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                repository.updateLatency(profile.id, pingMs)
+                VpnStateHolder.appendLog(
+                    "TCP",
+                    "Conexión TCP establecida con ${profile.host}:${profile.port} (${pingMs} ms)",
+                    LogLevel.SUCCESS
+                )
+            } catch (e: Exception) {
+                val errorDetail = e.localizedMessage ?: e.javaClass.simpleName
+                VpnStateHolder.appendLog(
+                    "VPS",
+                    "Sin respuesta de ${profile.host}:${profile.port} — $errorDetail",
+                    LogLevel.ERROR
+                )
+                if (!engineSettings.autoReconnect) {
+                    stopTunnel(
+                        status = VpnConnectionStatus.ERROR,
+                        message = "Sin respuesta de ${profile.host}:${profile.port} ($errorDetail)"
+                    )
+                }
+                return false
+            }
+
+            try {
+                socket.soTimeout = 4000
+                val out = socket.getOutputStream()
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                 val compiledPayload = BhttpPayloadBuilder.compile(profile)
                 val payloadBytes = compiledPayload.toByteArray(Charsets.UTF_8)
                 initialTxBytes = payloadBytes.size.toLong()
@@ -251,27 +283,27 @@ class JeffersVpnService : VpnService() {
                         LogLevel.WARNING
                     )
                 }
-            }
-        } catch (e: Exception) {
-            VpnStateHolder.appendLog(
-                if (isSshMode) "SSH" else "BHTTP",
-                "Error en intercambio inicial: ${e.localizedMessage ?: e.javaClass.simpleName}",
-                LogLevel.ERROR
-            )
-            if (!engineSettings.autoReconnect) {
-                stopTunnel(
-                    status = VpnConnectionStatus.ERROR,
-                    message = "Fallo en handshake (${e.localizedMessage ?: "Error de red"})"
+            } catch (e: Exception) {
+                VpnStateHolder.appendLog(
+                    "BHTTP",
+                    "Error en intercambio inicial: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                    LogLevel.ERROR
                 )
+                if (!engineSettings.autoReconnect) {
+                    stopTunnel(
+                        status = VpnConnectionStatus.ERROR,
+                        message = "Fallo en handshake (${e.localizedMessage ?: "Error de red"})"
+                    )
+                }
+                try { socket.close() } catch (_: Exception) {}
+                return false
             }
-            try { socket.close() } catch (_: Exception) {}
-            return false
-        }
 
-        // Close the initial handshake socket cleanly; TunPacketRelay manages live protected sockets
-        // without using TCP Urgent OOB probes that trigger 15-second proxy resets.
-        try { socket.close() } catch (_: Exception) {}
-        controlSocket = null
+            // Close the initial handshake socket cleanly; TunPacketRelay manages live protected sockets
+            // without using TCP Urgent OOB probes that trigger 15-second proxy resets.
+            try { socket.close() } catch (_: Exception) {}
+            controlSocket = null
+        }
 
         val activeDnsPrimary = engineSettings.dnsProvider.primary
         val activeDnsSecondary = engineSettings.dnsProvider.secondary
@@ -327,7 +359,11 @@ class JeffersVpnService : VpnService() {
                 pingMs = pingMs,
                 rxBytes = initialRxBytes,
                 txBytes = initialTxBytes,
-                statusMessage = "Túnel BHTTP activo • ${engineSettings.performanceMode.title}"
+                statusMessage = if (isSshMode) {
+                    "Túnel SSH activo • ${engineSettings.performanceMode.title}"
+                } else {
+                    "Túnel BHTTP activo • ${engineSettings.performanceMode.title}"
+                }
             )
         }
 
@@ -338,7 +374,10 @@ class JeffersVpnService : VpnService() {
             dnsSecondaryIp = activeDnsSecondary,
             vpsHost = profile.host,
             vpsPort = profile.port,
+            vpsUsername = sshUser,
             vpsPassword = profile.password,
+            sshCandidatePasswords = sshCandidatePasswords,
+            initialSshClient = establishedSshClient,
             scope = serviceScope,
             mtu = activeMtu
         )
@@ -377,6 +416,8 @@ class JeffersVpnService : VpnService() {
             relay.closeAllSessions()
             relayJob.cancel()
             activeRelay = null
+            activeSshClient?.disconnect()
+            activeSshClient = null
             if (!userInitiatedStop && sessionStartedAt > 0L) {
                 recordAndResetTun(VpnConnectionStatus.DISCONNECTED, "Túnel finalizado")
             }
@@ -413,6 +454,8 @@ class JeffersVpnService : VpnService() {
 
         try { controlSocket?.close() } catch (_: Exception) {}
         controlSocket = null
+        activeSshClient?.disconnect()
+        activeSshClient = null
         try { tunInterface?.close() } catch (_: Exception) {}
         tunInterface = null
 
@@ -428,6 +471,8 @@ class JeffersVpnService : VpnService() {
 
     private fun stopTunnel(status: VpnConnectionStatus, message: String?) {
         activeRelay?.closeAllSessions()
+        activeSshClient?.disconnect()
+        activeSshClient = null
         recordAndResetTun(status, message)
         connectionJob?.cancel()
         connectionJob = null
@@ -450,6 +495,8 @@ class JeffersVpnService : VpnService() {
 
     override fun onDestroy() {
         activeRelay?.closeAllSessions()
+        activeSshClient?.disconnect()
+        activeSshClient = null
         try {
             controlSocket?.close()
             tunInterface?.close()

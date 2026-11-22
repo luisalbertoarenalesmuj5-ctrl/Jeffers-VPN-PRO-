@@ -13,6 +13,8 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -30,7 +32,10 @@ class TunPacketRelay(
     private val dnsSecondaryIp: String,
     private val vpsHost: String,
     private val vpsPort: Int,
+    private val vpsUsername: String,
     private val vpsPassword: String,
+    private val sshCandidatePasswords: List<String> = listOf(vpsPassword),
+    private val initialSshClient: SshTunnelClient? = null,
     private val scope: CoroutineScope,
     private val mtu: Int = 1400
 ) {
@@ -45,6 +50,16 @@ class TunPacketRelay(
     private val tcpSessions = ConcurrentHashMap<TcpSessionKey, TcpSession>()
     private val udpSessions = ConcurrentHashMap<UdpSessionKey, UdpSession>()
     private val proxyProbeMutex = Mutex()
+    private val sshConnectMutex = Mutex()
+
+    @Volatile
+    private var activeSshClient: SshTunnelClient? = initialSshClient
+
+    @Volatile
+    private var ownedFallbackSshClient: SshTunnelClient? = null
+
+    @Volatile
+    private var sshFallbackCooldownUntil: Long = 0L
 
     @Volatile
     private var vpsSupportsConnect: Boolean = false
@@ -75,6 +90,50 @@ class TunPacketRelay(
         data object ShutdownOutput : OutboundOp
     }
 
+    private interface UpstreamTcpStream {
+        val inputStream: InputStream
+        val outputStream: OutputStream
+        fun configureConnected()
+        fun shutdownOutput()
+        fun close()
+    }
+
+    private class SocketUpstreamStream(private val socket: Socket) : UpstreamTcpStream {
+        override val inputStream: InputStream get() = socket.getInputStream()
+        override val outputStream: OutputStream get() = socket.getOutputStream()
+
+        override fun configureConnected() {
+            socket.soTimeout = 0
+            socket.tcpNoDelay = true
+            socket.keepAlive = true
+        }
+
+        override fun shutdownOutput() {
+            try {
+                socket.shutdownOutput()
+            } catch (_: Exception) {
+            }
+        }
+
+        override fun close() {
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private class SshUpstreamStream(private val stream: SshTcpStream) : UpstreamTcpStream {
+        override val inputStream: InputStream get() = stream.inputStream
+        override val outputStream: OutputStream get() = stream.outputStream
+
+        override fun configureConnected() = Unit
+
+        override fun shutdownOutput() = stream.shutdownOutput()
+
+        override fun close() = stream.close()
+    }
+
     private class TcpSession(
         val key: TcpSessionKey,
         val srcIp: ByteArray,
@@ -88,7 +147,7 @@ class TunPacketRelay(
         var pendingFinSeq: Long? = null,
         var clientFinReceived: Boolean = false,
         var serverFinSent: Boolean = false,
-        @Volatile var socket: Socket? = null,
+        @Volatile var upstream: UpstreamTcpStream? = null,
         @Volatile var writerJob: Job? = null,
         @Volatile var connected: Boolean = false,
         @Volatile var closed: Boolean = false,
@@ -117,10 +176,13 @@ class TunPacketRelay(
             }
         }
 
-        if (vpsPort != 22) {
+        if (activeSshClient == null && vpsPort != 22) {
             scope.launch(Dispatchers.IO) {
-                probeVpsConnectSupport("1.1.1.1", 443)?.let {
-                    try { it.close() } catch (_: Exception) {}
+                val proxySocket = probeVpsConnectSupport("1.1.1.1", 443)
+                if (proxySocket != null) {
+                    try { proxySocket.close() } catch (_: Exception) {}
+                } else {
+                    ensureSshFallbackConnected()
                 }
             }
         }
@@ -157,13 +219,17 @@ class TunPacketRelay(
             try { session.socket.close() } catch (_: Exception) {}
         }
         udpSessions.clear()
+
+        ownedFallbackSshClient?.disconnect()
+        ownedFallbackSshClient = null
+        activeSshClient = null
     }
 
     private fun closeTcpSession(session: TcpSession) {
         session.closed = true
         session.outboundChannel.close()
         session.writerJob?.cancel()
-        try { session.socket?.close() } catch (_: Exception) {}
+        session.upstream?.close()
     }
 
     private fun handleOutboundPacket(packet: ByteArray, output: FileOutputStream) {
@@ -329,8 +395,57 @@ class TunPacketRelay(
         }
     }
 
+    private suspend fun ensureSshFallbackConnected(): SshTunnelClient? {
+        activeSshClient?.let { current ->
+            if (current.isConnected()) return current
+        }
+        if (sshCandidatePasswords.isEmpty()) return null
+        val now = System.currentTimeMillis()
+        if (initialSshClient == null && now < sshFallbackCooldownUntil) return null
+
+        return sshConnectMutex.withLock {
+            activeSshClient?.let { locked ->
+                if (locked.isConnected()) return@withLock locked
+            }
+            if (initialSshClient != null) {
+                val result = initialSshClient.connect(4000)
+                return@withLock if (result.isSuccess) {
+                    activeSshClient = initialSshClient
+                    initialSshClient
+                } else {
+                    null
+                }
+            }
+            if (System.currentTimeMillis() < sshFallbackCooldownUntil) return@withLock null
+
+            val candidate = SshTunnelClient(
+                vpnService = vpnService,
+                host = vpsHost,
+                port = 22,
+                username = vpsUsername,
+                candidatePasswords = sshCandidatePasswords
+            )
+            val result = candidate.connect(2500)
+            if (result.isSuccess) {
+                ownedFallbackSshClient?.disconnect()
+                ownedFallbackSshClient = candidate
+                activeSshClient = candidate
+                VpnStateHolder.appendLog(
+                    "SSH",
+                    "Puerto $vpsPort sin proxy HTTP CONNECT; túnel SSH activo vía $vpsHost:22 ($vpsUsername)",
+                    LogLevel.SUCCESS
+                )
+                candidate
+            } else {
+                candidate.disconnect()
+                sshFallbackCooldownUntil = System.currentTimeMillis() + 120_000L
+                null
+            }
+        }
+    }
+
     private suspend fun probeVpsConnectSupport(dstHost: String, dstPort: Int): Socket? {
-        if (vpsPort == 22) return null
+        if (vpsPort == 22 || activeSshClient?.isConnected() == true) return null
         val now = System.currentTimeMillis()
         if (!vpsSupportsConnect && now < vpsConnectCooldownUntil) return null
 
@@ -384,18 +499,37 @@ class TunPacketRelay(
 
     private suspend fun connectAndBridgeTcpSession(session: TcpSession, output: FileOutputStream) {
         val dstHost = InetAddress.getByAddress(session.dstIp).hostAddress ?: return
-        var activeSocket: Socket? = null
+        var activeUpstream: UpstreamTcpStream? = null
         try {
-            if (vpsPort != 22) {
-                activeSocket = if (vpsSupportsConnect) {
+            // 1. Prefer real SSH direct-tcpip tunnel when active
+            val ssh = activeSshClient?.takeIf { it.isConnected() } ?: run {
+                if (initialSshClient != null) ensureSshFallbackConnected() else null
+            }
+            if (ssh != null) {
+                ssh.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { stream ->
+                    activeUpstream = SshUpstreamStream(stream)
+                }
+            }
+
+            // 2. Otherwise check HTTP CONNECT proxy on vpsHost:vpsPort (or fall back to SSH on :22)
+            if (activeUpstream == null && vpsPort != 22 && initialSshClient == null) {
+                val proxySocket = if (vpsSupportsConnect) {
                     openProxyConnectSocket(dstHost, session.key.dstPort)
                 } else {
                     probeVpsConnectSupport(dstHost, session.key.dstPort)
                 }
+                if (proxySocket != null) {
+                    activeUpstream = SocketUpstreamStream(proxySocket)
+                } else {
+                    ensureSshFallbackConnected()?.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { stream ->
+                        activeUpstream = SshUpstreamStream(stream)
+                    }
+                }
             }
 
-            if (activeSocket == null) {
-                if (!loggedDirectFallback && vpsPort != 22) {
+            // 3. Fallback to protected direct socket when neither HTTP CONNECT nor SSH is available
+            if (activeUpstream == null) {
+                if (!loggedDirectFallback && vpsPort != 22 && initialSshClient == null) {
                     loggedDirectFallback = true
                     VpnStateHolder.appendLog(
                         "RELAY",
@@ -411,22 +545,25 @@ class TunPacketRelay(
                 directSocket.tcpNoDelay = true
                 directSocket.keepAlive = true
                 directSocket.connect(InetSocketAddress(dstHost, session.key.dstPort), 4500)
-                activeSocket = directSocket
+                activeUpstream = SocketUpstreamStream(directSocket)
             }
 
-            if (session.closed) {
-                try { activeSocket.close() } catch (_: Exception) {}
+            val upstream = activeUpstream ?: run {
+                closeSessionWithRst(session, output)
                 return
             }
 
-            activeSocket.soTimeout = 0
-            activeSocket.tcpNoDelay = true
-            activeSocket.keepAlive = true
-            session.socket = activeSocket
+            if (session.closed) {
+                upstream.close()
+                return
+            }
+
+            upstream.configureConnected()
+            session.upstream = upstream
             session.connected = true
 
             session.writerJob = scope.launch(Dispatchers.IO) {
-                val out = activeSocket.getOutputStream()
+                val out = upstream.outputStream
                 try {
                     for (op in session.outboundChannel) {
                         if (session.closed) break
@@ -437,10 +574,7 @@ class TunPacketRelay(
                                 session.lastActivityAt = System.currentTimeMillis()
                             }
                             is OutboundOp.ShutdownOutput -> {
-                                try {
-                                    activeSocket.shutdownOutput()
-                                } catch (_: Exception) {
-                                }
+                                upstream.shutdownOutput()
                             }
                         }
                     }
@@ -454,8 +588,8 @@ class TunPacketRelay(
             // Send SYN+ACK with clamped MSS option so client respects TUN MTU
             sendTcpSynAckPacket(session, advertisedMss, output)
 
-            // Relay downstream bytes from upstream socket back to TUN
-            val inStream = activeSocket.getInputStream()
+            // Relay downstream bytes from upstream stream back to TUN
+            val inStream = upstream.inputStream
             val buf = ByteArray(maxTcpPayload)
             while (scope.isActive && !session.closed) {
                 val n = try {
@@ -751,6 +885,56 @@ class TunPacketRelay(
         val dstPort = readUShort(requestPacket, udpOffset + 2)
 
         val candidates = listOf(dnsPrimaryIp, dnsSecondaryIp, "8.8.8.8", "1.1.1.1").distinct()
+
+        // When an SSH tunnel is active, resolve DNS over TCP through the VPS SSH tunnel first
+        val ssh = activeSshClient?.takeIf { it.isConnected() }
+        if (ssh != null) {
+            for (dnsIp in candidates.take(2)) {
+                var sshDns: SshTcpStream? = null
+                try {
+                    sshDns = ssh.openDirectTcpIp(dnsIp, DNS_PORT, 1000)
+                    if (sshDns != null) {
+                        val framedQuery = ByteArray(2 + dnsPayload.size)
+                        framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
+                        framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
+                        System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
+                        sshDns.outputStream.write(framedQuery)
+                        sshDns.outputStream.flush()
+
+                        val inStream = sshDns.inputStream
+                        val lenHi = inStream.read()
+                        val lenLo = inStream.read()
+                        if (lenHi >= 0 && lenLo >= 0) {
+                            val respLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
+                            if (respLen in 12..maxUdpPayload) {
+                                val responsePayload = ByteArray(respLen)
+                                var readTotal = 0
+                                while (readTotal < respLen) {
+                                    val r = inStream.read(responsePayload, readTotal, respLen - readTotal)
+                                    if (r <= 0) break
+                                    readTotal += r
+                                }
+                                if (readTotal == respLen) {
+                                    val ipPacket = buildIpv4UdpPacket(
+                                        srcIp = dstIp,
+                                        dstIp = srcIp,
+                                        srcPort = dstPort,
+                                        dstPort = srcPort,
+                                        payload = responsePayload
+                                    )
+                                    writePacketToTun(ipPacket, output)
+                                    return
+                                }
+                            }
+                        }
+                    }
+                } catch (_: Exception) {
+                } finally {
+                    sshDns?.close()
+                }
+            }
+        }
+
         for (dnsIp in candidates) {
             var socket: DatagramSocket? = null
             try {
