@@ -3,6 +3,7 @@ package com.example.vpn
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import com.example.data.model.LogLevel
+import com.example.data.model.TunnelDiagnosticsState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -22,6 +23,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
@@ -46,6 +48,9 @@ class TunPacketRelay internal constructor(
     },
     private val onStatusMessage: (String) -> Unit = { msg ->
         VpnStateHolder.updateTelemetry { it.copy(statusMessage = msg) }
+    },
+    private val onDiagnostics: ((TunnelDiagnosticsState) -> TunnelDiagnosticsState) -> Unit = { transform ->
+        VpnStateHolder.updateDiagnostics(transform)
     }
 ) {
     constructor(
@@ -123,6 +128,15 @@ class TunPacketRelay internal constructor(
 
     @Volatile
     private var lastDirectFailureLogAt: Long = 0L
+
+    private val loggedFirstDnsOk = AtomicBoolean(false)
+    private val lastDnsFailLogAt = AtomicLong(0L)
+    private val loggedFirstTcpOk = AtomicBoolean(false)
+    private val loggedIpv6Reject = AtomicBoolean(false)
+    private val loggedOrphanRst = AtomicBoolean(false)
+    private val loggedQuicReject = AtomicBoolean(false)
+    private val lastProxyFailLogAt = AtomicLong(0L)
+    private val tcpFailStreak = AtomicLong(0L)
 
     private data class TcpSessionKey(
         val srcPort: Int,
@@ -227,13 +241,38 @@ class TunPacketRelay internal constructor(
             }
         }
 
+        val initialMode = when {
+            activeSshClient?.isConnected() == true || vpsPort == 22 -> "SSH Directo ($vpsHost:22)"
+            vpsHost.isNotBlank() && vpsPort > 0 -> "BHTTP / Sondeando :$vpsPort"
+            else -> "Relay Local"
+        }
+        onDiagnostics {
+            it.copy(
+                tunnelMode = initialMode,
+                activeTcpSessions = 0,
+                activeUdpSessions = 0
+            )
+        }
+        onLog(
+            "TUN",
+            "Relay TUN activo • MTU=$mtu MSS=$advertisedMss MaxUDP=$maxUdpPayload • DNS=$dnsPrimaryIp/$dnsSecondaryIp",
+            LogLevel.INFO
+        )
+
         if (activeSshClient == null && vpsPort != 22 && vpsHost.isNotBlank()) {
             startupProbeJob = scope.launch(Dispatchers.IO) {
+                onLog("PROBE", "Sondeando soporte proxy HTTP CONNECT en $vpsHost:$vpsPort…", LogLevel.INFO)
                 val proxySocket = probeVpsConnectSupport("1.1.1.1", 443)
                 if (proxySocket != null) {
                     try { proxySocket.close() } catch (_: Exception) {}
+                    onDiagnostics { it.copy(tunnelMode = "Proxy HTTP CONNECT (:$vpsPort)") }
                 } else {
-                    ensureSshFallbackConnected()
+                    val ssh = ensureSshFallbackConnected()
+                    if (ssh == null) {
+                        onDiagnostics {
+                            it.copy(tunnelMode = "Directo protegido (sin proxy/SSH :$vpsPort)")
+                        }
+                    }
                 }
             }
         }
@@ -321,16 +360,29 @@ class TunPacketRelay internal constructor(
     private fun handleIpv6Packet(packet: ByteArray, output: OutputStream) {
         if (packet.size < 40) return
         val nextHeader = packet[6].toInt() and 0xFF
+        var rejected = false
         when (nextHeader) {
             PROTOCOL_TCP -> {
                 buildIpv6TcpRstPacket(packet)?.let { rst ->
                     writePacketToTun(rst, output)
+                    rejected = true
                 }
             }
             PROTOCOL_UDP -> {
                 buildIpv6IcmpPortUnreachablePacket(packet, maxTcpPayload)?.let { icmpv6 ->
                     writePacketToTun(icmpv6, output)
+                    rejected = true
                 }
+            }
+        }
+        if (rejected) {
+            onDiagnostics { it.copy(ipv6RejectedCount = it.ipv6RejectedCount + 1) }
+            if (loggedIpv6Reject.compareAndSet(false, true)) {
+                onLog(
+                    "TUN",
+                    "Tráfico IPv6 rechazado al instante (TCPv6 RST / ICMPv6) para forzar salida IPv4",
+                    LogLevel.INFO
+                )
             }
         }
     }
@@ -416,6 +468,14 @@ class TunPacketRelay internal constructor(
                     )
                 }
                 writePacketToTun(rstPacket, output)
+                onDiagnostics { it.copy(orphanRstCount = it.orphanRstCount + 1) }
+                if (loggedOrphanRst.compareAndSet(false, true)) {
+                    onLog(
+                        "TCP",
+                        "Paquete huérfano sin sesión ($dstPort) -> RST enviado para resincronizar app",
+                        LogLevel.INFO
+                    )
+                }
             }
             return
         }
@@ -523,6 +583,7 @@ class TunPacketRelay internal constructor(
             }
             if (System.currentTimeMillis() < sshFallbackCooldownUntil) return@withLock null
 
+            onLog("SSH", "Probando respaldo SSH en $vpsHost:22 ($vpsUsername)…", LogLevel.INFO)
             val candidate = factory(22)
             val result = candidate.connect(4500)
             if (result.isSuccess) {
@@ -530,6 +591,7 @@ class TunPacketRelay internal constructor(
                 ownedFallbackSshClient = candidate
                 activeSshClient = candidate
                 onStatusMessage("Túnel SSH activo • $vpsHost:22")
+                onDiagnostics { it.copy(tunnelMode = "SSH Respaldo ($vpsHost:22)") }
                 onLog(
                     "SSH",
                     "Puerto $vpsPort sin proxy HTTP CONNECT; túnel SSH activo vía $vpsHost:22 ($vpsUsername)",
@@ -570,10 +632,12 @@ class TunPacketRelay internal constructor(
         return try {
             if (!protectSocket(proxySocket)) {
                 try { proxySocket.close() } catch (_: Exception) {}
+                onLog("PROXY", "No se pudo proteger socket proxy hacia $vpsHost:$vpsPort", LogLevel.WARNING)
                 return null
             }
             proxySocket.tcpNoDelay = true
             proxySocket.keepAlive = true
+            val startNs = System.nanoTime()
             proxySocket.connect(InetSocketAddress(vpsHost, vpsPort), 900)
             proxySocket.soTimeout = 900
 
@@ -587,19 +651,46 @@ class TunPacketRelay internal constructor(
             proxySocket.getOutputStream().flush()
 
             val headerText = readHttpHeadersExact(proxySocket.getInputStream())
-            if (headerText != null && headerText.lineSequence().firstOrNull()?.contains(" 200 ") == true) {
+            val rtt = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+            val statusLine = headerText?.lineSequence()?.firstOrNull()?.trim()
+            if (statusLine != null && statusLine.contains(" 200 ")) {
+                if (!vpsSupportsConnect) {
+                    onLog(
+                        "PROXY",
+                        "HTTP CONNECT $vpsHost:$vpsPort aceptado (${rtt}ms): $statusLine",
+                        LogLevel.SUCCESS
+                    )
+                }
                 vpsSupportsConnect = true
                 proxySocket
             } else {
                 try { proxySocket.close() } catch (_: Exception) {}
                 vpsSupportsConnect = false
                 vpsConnectCooldownUntil = System.currentTimeMillis() + 120_000L
+                val now = System.currentTimeMillis()
+                if (now - lastProxyFailLogAt.get() > 15_000L) {
+                    lastProxyFailLogAt.set(now)
+                    onLog(
+                        "PROXY",
+                        "HTTP CONNECT $vpsHost:$vpsPort sin túnel (${rtt}ms): ${statusLine ?: "EOF sin cabecera HTTP"}",
+                        LogLevel.WARNING
+                    )
+                }
                 null
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             try { proxySocket.close() } catch (_: Exception) {}
             vpsSupportsConnect = false
             vpsConnectCooldownUntil = System.currentTimeMillis() + 120_000L
+            val now = System.currentTimeMillis()
+            if (now - lastProxyFailLogAt.get() > 15_000L) {
+                lastProxyFailLogAt.set(now)
+                onLog(
+                    "PROXY",
+                    "Error HTTP CONNECT $vpsHost:$vpsPort: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                    LogLevel.WARNING
+                )
+            }
             null
         }
     }
@@ -607,6 +698,7 @@ class TunPacketRelay internal constructor(
     private suspend fun connectAndBridgeTcpSession(session: TcpSession, output: OutputStream) {
         val dstHost = InetAddress.getByAddress(session.dstIp).hostAddress ?: return
         var activeUpstream: UpstreamTcpStream? = null
+        var transportLabel = "DIRECTO"
         try {
             // 1. Prefer real SSH direct-tcpip tunnel when active
             var ssh = activeSshClient?.takeIf { it.isConnected() } ?: run {
@@ -616,10 +708,12 @@ class TunPacketRelay internal constructor(
                 val stream = ssh.openDirectTcpIp(dstHost, session.key.dstPort, 4500)
                 if (stream != null) {
                     activeUpstream = SshUpstreamStream(stream)
+                    transportLabel = "SSH"
                 } else if (!ssh.isConnected()) {
                     ssh = ensureSshFallbackConnected()
                     ssh?.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { retried ->
                         activeUpstream = SshUpstreamStream(retried)
+                        transportLabel = "SSH"
                     }
                 }
             }
@@ -636,12 +730,15 @@ class TunPacketRelay internal constructor(
                 }
                 if (proxySocket != null) {
                     activeUpstream = SocketUpstreamStream(proxySocket)
+                    transportLabel = "HTTP-CONNECT"
                     onStatusMessage("Proxy HTTP CONNECT activo • $vpsHost:$vpsPort")
+                    onDiagnostics { it.copy(tunnelMode = "Proxy HTTP CONNECT (:$vpsPort)") }
                 } else {
                     val fallbackSsh = ensureSshFallbackConnected()
                     if (fallbackSsh != null) {
                         fallbackSsh.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { stream ->
                             activeUpstream = SshUpstreamStream(stream)
+                            transportLabel = "SSH"
                         }
                     }
                 }
@@ -652,24 +749,39 @@ class TunPacketRelay internal constructor(
                 if (!loggedDirectFallback && vpsPort != 22 && initialSshClient == null && vpsHost.isNotBlank()) {
                     loggedDirectFallback = true
                     onStatusMessage("Red directa protegida (sin proxy/SSH en VPS)")
+                    onDiagnostics { it.copy(tunnelMode = "Directo protegido (sin proxy/SSH :$vpsPort)") }
                     onLog(
                         "RELAY",
-                        "Puerto $vpsPort no actúa como proxy HTTP CONNECT; enrutando tráfico por socket protegido",
-                        LogLevel.INFO
+                        "Puerto $vpsPort no actúa como proxy HTTP CONNECT ni SSH; enrutando tráfico por socket protegido",
+                        LogLevel.WARNING
                     )
                 }
                 val directSocket = Socket()
                 if (!protectSocket(directSocket)) {
-                    closeSessionWithRst(session, output)
-                    return
+                    throw java.io.IOException("No se pudo proteger el socket directo hacia $dstHost:${session.key.dstPort}")
                 }
                 directSocket.tcpNoDelay = true
                 directSocket.keepAlive = true
                 directSocket.connect(InetSocketAddress(dstHost, session.key.dstPort), 4500)
                 activeUpstream = SocketUpstreamStream(directSocket)
+                transportLabel = "DIRECTO"
             }
 
             val upstream = activeUpstream ?: run {
+                val errHint = activeSshClient?.lastErrorMessage ?: "Sin canal SSH/Proxy disponible"
+                onDiagnostics {
+                    it.copy(
+                        tcpFailCount = it.tcpFailCount + 1,
+                        lastTcpDetail = "$dstHost:${session.key.dstPort} ($errHint)",
+                        activeTcpSessions = tcpSessions.size
+                    )
+                }
+                val streak = tcpFailStreak.incrementAndGet()
+                val now = System.currentTimeMillis()
+                if (streak <= 3L || now - lastDirectFailureLogAt > 4000L) {
+                    lastDirectFailureLogAt = now
+                    onLog("TCP", "Canal rechazado a $dstHost:${session.key.dstPort}: $errHint", LogLevel.ERROR)
+                }
                 closeSessionWithRst(session, output)
                 return
             }
@@ -707,6 +819,21 @@ class TunPacketRelay internal constructor(
 
             // Send SYN+ACK with clamped MSS option so client respects TUN MTU
             sendTcpSynAckPacket(session, advertisedMss, output)
+            tcpFailStreak.set(0L)
+            onDiagnostics {
+                it.copy(
+                    tcpOkCount = it.tcpOkCount + 1,
+                    lastTcpDetail = "$transportLabel → $dstHost:${session.key.dstPort}",
+                    activeTcpSessions = tcpSessions.size
+                )
+            }
+            if (loggedFirstTcpOk.compareAndSet(false, true)) {
+                onLog(
+                    "TCP",
+                    "Primer enlace TCP activo [$transportLabel] → $dstHost:${session.key.dstPort}",
+                    LogLevel.SUCCESS
+                )
+            }
 
             // Relay downstream bytes from upstream stream back to TUN
             val inStream = upstream.inputStream
@@ -734,19 +861,28 @@ class TunPacketRelay internal constructor(
                 sendTcpFinAckPacket(session, output)
             }
         } catch (e: Exception) {
+            val detail = e.localizedMessage ?: e.javaClass.simpleName
+            val streak = tcpFailStreak.incrementAndGet()
             val now = System.currentTimeMillis()
-            if (now - lastDirectFailureLogAt > 15_000L) {
+            onDiagnostics {
+                it.copy(
+                    tcpFailCount = it.tcpFailCount + 1,
+                    lastTcpDetail = "Error $dstHost:${session.key.dstPort}: $detail"
+                )
+            }
+            if (streak <= 3L || now - lastDirectFailureLogAt > 4_000L) {
                 lastDirectFailureLogAt = now
                 onLog(
-                    "RELAY",
-                    "Sin salida TCP a $dstHost:${session.key.dstPort} (${e.localizedMessage ?: e.javaClass.simpleName})",
-                    LogLevel.WARNING
+                    "TCP",
+                    "Fallo salida TCP [$transportLabel] → $dstHost:${session.key.dstPort} ($detail)",
+                    LogLevel.ERROR
                 )
             }
             closeSessionWithRst(session, output)
         } finally {
             closeTcpSession(session)
             tcpSessions.remove(session.key, session)
+            onDiagnostics { it.copy(activeTcpSessions = tcpSessions.size) }
         }
     }
 
@@ -917,6 +1053,13 @@ class TunPacketRelay internal constructor(
             buildIpv4IcmpPortUnreachablePacket(packet, ihlBytes)?.let { icmpPacket ->
                 writePacketToTun(icmpPacket, output)
             }
+            if (loggedQuicReject.compareAndSet(false, true)) {
+                onLog(
+                    "UDP",
+                    "UDP/QUIC rechazado en modo túnel TCP para forzar tráfico HTTPS por TCP",
+                    LogLevel.INFO
+                )
+            }
             return
         }
 
@@ -957,6 +1100,7 @@ class TunPacketRelay internal constructor(
                 session = prev
             } else {
                 session = created
+                onDiagnostics { it.copy(activeUdpSessions = udpSessions.size) }
                 created.readerJob = scope.launch(Dispatchers.IO) {
                     val buf = ByteArray(4096)
                     val dp = DatagramPacket(buf, buf.size)
@@ -982,6 +1126,7 @@ class TunPacketRelay internal constructor(
                         created.closed = true
                         try { sock.close() } catch (_: Exception) {}
                         udpSessions.remove(key, created)
+                        onDiagnostics { it.copy(activeUdpSessions = udpSessions.size) }
                     }
                 }
             }
@@ -1016,6 +1161,8 @@ class TunPacketRelay internal constructor(
         val dstPort = readUShort(requestPacket, udpOffset + 2)
 
         val candidates = listOf(dnsPrimaryIp, dnsSecondaryIp, "8.8.8.8", "1.1.1.1").distinct()
+        val dnsStartNs = System.nanoTime()
+        var lastDnsErr: String? = null
 
         // If startup proxy/SSH probe is actively handshaking right now, wait briefly so first DNS queries use SSH
         if (activeSshClient == null && !vpsSupportsConnect) {
@@ -1076,12 +1223,25 @@ class TunPacketRelay internal constructor(
                                         payload = finalPayload
                                     )
                                     writePacketToTun(ipPacket, output)
+                                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
+                                    onDiagnostics {
+                                        it.copy(
+                                            dnsOkCount = it.dnsOkCount + 1,
+                                            lastDnsDetail = "SSH-TCP $dnsIp (${ms}ms)"
+                                        )
+                                    }
+                                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
+                                        onLog("DNS", "DNS resuelto vía SSH-TCP ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
+                                    }
                                     return true
                                 }
                             }
                         }
+                    } else {
+                        lastDnsErr = "SSH direct-tcpip $dnsIp:53 rechazado"
                     }
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    lastDnsErr = "SSH DNS $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
                 } finally {
                     timeoutJob?.cancel()
                     sshDns?.close()
@@ -1122,6 +1282,16 @@ class TunPacketRelay internal constructor(
                         payload = responsePayload
                     )
                     writePacketToTun(ipPacket, output)
+                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
+                    onDiagnostics {
+                        it.copy(
+                            dnsOkCount = it.dnsOkCount + 1,
+                            lastDnsDetail = "UDP $dnsIp (${ms}ms)"
+                        )
+                    }
+                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
+                        onLog("DNS", "DNS resuelto vía UDP protegido ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
+                    }
                     return
                 } else if (receivedLen > maxUdpPayload && dnsPayload.size >= 12) {
                     // Signal TC=1 so client retries DNS over TCP without truncation
@@ -1135,10 +1305,17 @@ class TunPacketRelay internal constructor(
                         payload = tcResp
                     )
                     writePacketToTun(ipPacket, output)
+                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
+                    onDiagnostics {
+                        it.copy(
+                            dnsOkCount = it.dnsOkCount + 1,
+                            lastDnsDetail = "UDP-TC $dnsIp (${ms}ms)"
+                        )
+                    }
                     return
                 }
-            } catch (_: Exception) {
-                // Fast failover to next DNS server
+            } catch (e: Exception) {
+                lastDnsErr = "UDP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
             } finally {
                 try { socket?.close() } catch (_: Exception) {}
             }
@@ -1202,12 +1379,36 @@ class TunPacketRelay internal constructor(
                         payload = finalPayload
                     )
                     writePacketToTun(ipPacket, output)
+                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
+                    onDiagnostics {
+                        it.copy(
+                            dnsOkCount = it.dnsOkCount + 1,
+                            lastDnsDetail = "TCP $dnsIp (${ms}ms)"
+                        )
+                    }
+                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
+                        onLog("DNS", "DNS resuelto vía TCP ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
+                    }
                     return
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                lastDnsErr = "TCP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
             } finally {
                 try { tcpSocket?.close() } catch (_: Exception) {}
             }
+        }
+
+        val reason = lastDnsErr ?: "Sin respuesta en ${candidates.joinToString()}"
+        onDiagnostics {
+            it.copy(
+                dnsFailCount = it.dnsFailCount + 1,
+                lastDnsDetail = reason
+            )
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastDnsFailLogAt.get() > 3_000L) {
+            lastDnsFailLogAt.set(now)
+            onLog("DNS", "Fallo DNS en todos los servidores ($reason)", LogLevel.ERROR)
         }
     }
 

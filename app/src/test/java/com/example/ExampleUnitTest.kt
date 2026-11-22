@@ -803,6 +803,155 @@ class ExampleUnitTest {
         assertTrue(PlanTier.SUPER_PRO.unlocksServerTier(PlanTier.PREMIUM))
         assertTrue(PlanTier.SUPER_PRO.unlocksServerTier(PlanTier.SUPER_PRO))
     }
+
+    @Test
+    fun `vpnStateHolder tracks diagnostics counters and rolling 10 minute monitor samples`() {
+        com.example.vpn.VpnStateHolder.resetDiagnostics()
+        com.example.vpn.VpnStateHolder.updateDiagnostics {
+            it.copy(
+                tunnelMode = "SSH Respaldo (192.6.154.212:22)",
+                dnsOkCount = 3,
+                dnsFailCount = 1,
+                tcpOkCount = 5,
+                tcpFailCount = 0,
+                sshFailCount = 1
+            )
+        }
+        com.example.vpn.VpnStateHolder.recordMonitorSample(
+            rxBytesPerSec = 12_400L,
+            txBytesPerSec = 3_200L,
+            pingMs = 48
+        )
+
+        val diag = com.example.vpn.VpnStateHolder.diagnostics.value
+        val samples = com.example.vpn.VpnStateHolder.monitorSamples.value
+        assertEquals("SSH Respaldo (192.6.154.212:22)", diag.tunnelMode)
+        assertEquals(3, diag.dnsOkCount)
+        assertEquals(1, samples.size)
+        assertEquals(12_400L, samples.first().rxBytesPerSec)
+        assertEquals(2, samples.first().errorCount) // dnsFail + tcpFail + sshFail
+
+        com.example.vpn.VpnStateHolder.resetDiagnostics()
+        assertEquals("Inactivo", com.example.vpn.VpnStateHolder.diagnostics.value.tunnelMode)
+        assertTrue(com.example.vpn.VpnStateHolder.monitorSamples.value.isEmpty())
+    }
+
+    @Test
+    fun `networkDiagnosticEngine builds valid DNS query and diagnoses ssh plus proxy failures`() {
+        val pkt = com.example.vpn.NetworkDiagnosticEngine.buildDnsAQueryPacket("google.com", txId = 0x1234)
+        assertEquals(0x12.toByte(), pkt[0])
+        assertEquals(0x34.toByte(), pkt[1])
+        assertEquals(0x01.toByte(), pkt[2]) // RD bit
+        assertEquals(6.toByte(), pkt[12]) // "google".length
+        assertEquals('g'.code.toByte(), pkt[13])
+
+        val checks = listOf(
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "dns_udp",
+                title = "DNS",
+                detail = "OK",
+                status = com.example.data.model.DiagnosticCheckStatus.PASS,
+                latencyMs = 20
+            ),
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "proxy_connect",
+                title = "Proxy",
+                detail = "EOF",
+                status = com.example.data.model.DiagnosticCheckStatus.WARN
+            ),
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "ssh_tunnel",
+                title = "SSH",
+                detail = "Auth fail",
+                status = com.example.data.model.DiagnosticCheckStatus.FAIL
+            ),
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "direct_http",
+                title = "HTTP",
+                detail = "204",
+                status = com.example.data.model.DiagnosticCheckStatus.PASS
+            )
+        )
+        val (overall, summary, recommendation) = com.example.vpn.NetworkDiagnosticEngine.summarizeDiagnosticChecks(
+            checks = checks,
+            tunnelDiagnostics = com.example.data.model.TunnelDiagnosticsState(),
+            host = "192.6.154.212",
+            port = 8080
+        )
+        assertEquals(com.example.data.model.DiagnosticCheckStatus.FAIL, overall)
+        assertTrue(summary.contains("8080") && summary.contains("SSH"))
+        assertTrue(recommendation.isNotBlank())
+    }
+
+    @Test
+    fun `tunPacketRelay emits diagnostic counters and log lines on live loopback`() {
+        val httpServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val serverPort = httpServer.localPort
+        val serverThread = thread(start = true) {
+            try {
+                val client = httpServer.accept()
+                client.close()
+            } catch (_: Exception) {
+            }
+        }
+        val tunToRelay = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayToTun = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
+        val capturedLogs = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val diagStateRef = java.util.concurrent.atomic.AtomicReference(com.example.data.model.TunnelDiagnosticsState())
+
+        val relay = TunPacketRelay(
+            protectSocket = { true },
+            protectDatagramSocket = { true },
+            tunInputProvider = { PacketQueueInputStream(tunToRelay) },
+            tunOutputProvider = { PacketQueueOutputStream(relayToTun) },
+            dnsPrimaryIp = "127.0.0.1",
+            dnsSecondaryIp = "127.0.0.1",
+            vpsHost = "",
+            vpsPort = 0,
+            vpsUsername = "root",
+            vpsPassword = "",
+            sshCandidatePasswords = emptyList(),
+            initialSshClient = null,
+            scope = relayScope,
+            mtu = 1400,
+            sshClientFactory = null,
+            onLog = { tag, msg, _ -> capturedLogs.add("[$tag] $msg") },
+            onStatusMessage = {},
+            onDiagnostics = { transform -> diagStateRef.updateAndGet(transform) }
+        )
+        val relayThread = thread(start = true) { relay.runLoop() }
+
+        try {
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = byteArrayOf(10, 8, 0, 2),
+                    dstIp = byteArrayOf(127, 0, 0, 1),
+                    srcPort = 54001,
+                    dstPort = serverPort,
+                    seqNum = 5000L,
+                    ackNum = 0L,
+                    flags = 0x02,
+                    payload = ByteArray(0)
+                )
+            )
+            val synAck = relayToTun.poll(3, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull(synAck)
+            Thread.sleep(150)
+            assertTrue(diagStateRef.get().tcpOkCount >= 1)
+            assertTrue(capturedLogs.any { it.contains("[TUN]") && it.contains("MTU=1400") })
+            assertTrue(capturedLogs.any { it.contains("[TCP]") && it.contains("Primer enlace TCP") })
+        } finally {
+            tunToRelay.offer(ByteArray(0))
+            relay.closeAllSessions()
+            relayScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            try { httpServer.close() } catch (_: Exception) {}
+            serverThread.join(1000)
+            relayThread.join(1000)
+        }
+    }
 }
 
 

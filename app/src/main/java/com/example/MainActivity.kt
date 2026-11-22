@@ -699,6 +699,7 @@ private fun JeffersVpnAppContent(
                         uiState = uiState,
                         onClearLogs = viewModel::clearLogs,
                         onClearHistory = viewModel::clearSessionHistory,
+                        onRunDiagnostics = viewModel::runNetworkDiagnostics,
                         onBack = { navController.popBackStack() }
                     )
                 }

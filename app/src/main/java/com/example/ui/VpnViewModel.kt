@@ -20,10 +20,13 @@ import com.example.data.model.CountryRegion
 import com.example.data.model.DnsProvider
 import com.example.data.model.HomeLayoutStyle
 import com.example.data.model.LogLevel
+import com.example.data.model.NetworkDiagnosticReport
 import com.example.data.model.PingTestResult
 import com.example.data.model.PlanTier
 import com.example.data.model.ServerAnimationStyle
 import com.example.data.model.ThemePreset
+import com.example.data.model.TunnelDiagnosticsState
+import com.example.data.model.TunnelMonitorSample
 import com.example.data.model.TunnelProtocol
 import com.example.data.model.VpnConnectionStatus
 import com.example.data.model.VpnLogEntry
@@ -42,6 +45,7 @@ import com.example.vpn.BhttpPayloadBuilder
 import com.example.vpn.JeffersVpnService
 import com.example.vpn.LicenseCodeEngine
 import com.example.vpn.LicenseValidationResult
+import com.example.vpn.NetworkDiagnosticEngine
 import com.example.vpn.VpnStateHolder
 import com.example.vpn.VpsAnalysisReport
 import com.example.vpn.VpsAnalyzerEngine
@@ -70,7 +74,18 @@ data class VpnDashboardUiState(
     val settings: AppSettingsState = AppSettingsState(),
     val isTestingPing: Boolean = false,
     val testingProfileId: Long? = null,
-    val lastPingResult: PingTestResult? = null
+    val lastPingResult: PingTestResult? = null,
+    val diagnostics: TunnelDiagnosticsState = TunnelDiagnosticsState(),
+    val monitorSamples: List<TunnelMonitorSample> = emptyList(),
+    val diagnosticReport: NetworkDiagnosticReport? = null,
+    val isRunningDiagnostic: Boolean = false
+)
+
+private data class DiagnosticUiBundle(
+    val diagnostics: TunnelDiagnosticsState,
+    val monitorSamples: List<TunnelMonitorSample>,
+    val diagnosticReport: NetworkDiagnosticReport?,
+    val isRunningDiagnostic: Boolean
 )
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -82,6 +97,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _isTestingPing = MutableStateFlow(false)
     private val _testingProfileId = MutableStateFlow<Long?>(null)
     private val _lastPingResult = MutableStateFlow<PingTestResult?>(null)
+    private val _isRunningDiagnostic = MutableStateFlow(false)
+    private val _diagnosticReport = MutableStateFlow<NetworkDiagnosticReport?>(null)
 
     private val _isCheckingHost = MutableStateFlow(false)
     val isCheckingHost: StateFlow<Boolean> = _isCheckingHost.asStateFlow()
@@ -122,6 +139,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     val hotspotRunning: StateFlow<Boolean> = HotspotProxyManager.isRunning
     val hotspotClients: StateFlow<Int> = HotspotProxyManager.activeClients
 
+    private val diagnosticBundleFlow = combine(
+        VpnStateHolder.diagnostics,
+        VpnStateHolder.monitorSamples,
+        _diagnosticReport,
+        _isRunningDiagnostic
+    ) { diagnostics, samples, report, running ->
+        DiagnosticUiBundle(diagnostics, samples, report, running)
+    }
+
     val uiState: StateFlow<VpnDashboardUiState> = combine(
         repository.profiles,
         repository.selectedProfile,
@@ -146,6 +172,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         state.copy(testingProfileId = profileId)
     }.combine(_lastPingResult) { state, pingResult ->
         state.copy(lastPingResult = pingResult)
+    }.combine(diagnosticBundleFlow) { state, bundle ->
+        state.copy(
+            diagnostics = bundle.diagnostics,
+            monitorSamples = bundle.monitorSamples,
+            diagnosticReport = bundle.diagnosticReport,
+            isRunningDiagnostic = bundle.isRunningDiagnostic
+        )
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000L),
@@ -1543,6 +1576,23 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearLogs() = VpnStateHolder.clearLogs()
+
+    fun runNetworkDiagnostics() {
+        if (_isRunningDiagnostic.value) return
+        viewModelScope.launch {
+            _isRunningDiagnostic.value = true
+            try {
+                val report = NetworkDiagnosticEngine.runDiagnostics(
+                    context = getApplication(),
+                    profile = uiState.value.selectedProfile,
+                    settings = settingsStore.settings.value
+                )
+                _diagnosticReport.value = report
+            } finally {
+                _isRunningDiagnostic.value = false
+            }
+        }
+    }
 
     fun clearSessionHistory() {
         viewModelScope.launch { repository.clearSessions() }

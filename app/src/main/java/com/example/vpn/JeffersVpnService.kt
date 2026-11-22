@@ -141,6 +141,7 @@ class JeffersVpnService : VpnService() {
         val carrier = CarrierType.fromName(profile.carrier)
         val protocol = TunnelProtocol.fromName(profile.protocol)
 
+        VpnStateHolder.resetDiagnostics()
         VpnStateHolder.updateTelemetry {
             it.copy(
                 status = VpnConnectionStatus.CONNECTING,
@@ -267,26 +268,35 @@ class JeffersVpnService : VpnService() {
                 val compiledPayload = BhttpPayloadBuilder.compile(profile)
                 val payloadBytes = compiledPayload.toByteArray(Charsets.UTF_8)
                 initialTxBytes = payloadBytes.size.toLong()
+                val bhttpStartNs = System.nanoTime()
                 out.write(payloadBytes)
                 out.flush()
                 VpnStateHolder.appendLog(
                     "BHTTP",
-                    "Handshake BHTTP enviado ($initialTxBytes B) • SNI=${profile.sniHost}",
+                    "Handshake BHTTP enviado a ${profile.host}:${profile.port} ($initialTxBytes B) • SNI=${profile.sniHost}",
                     LogLevel.INFO
                 )
 
+                var bhttpReadErr: String? = null
                 val statusLine = try {
                     reader.readLine()
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    bhttpReadErr = e.localizedMessage ?: e.javaClass.simpleName
                     null
                 }
+                val bhttpMs = ((System.nanoTime() - bhttpStartNs) / 1_000_000L).toInt().coerceAtLeast(1)
                 if (statusLine != null) {
                     initialRxBytes += statusLine.toByteArray(Charsets.UTF_8).size
-                    VpnStateHolder.appendLog("BHTTP", "Respuesta servidor: $statusLine", LogLevel.SUCCESS)
-                } else {
                     VpnStateHolder.appendLog(
                         "BHTTP",
-                        "Socket abierto sin banner inmediato; manteniendo túnel activo",
+                        "BHTTP ${profile.host}:${profile.port} respondió '$statusLine' (${bhttpMs}ms)",
+                        LogLevel.SUCCESS
+                    )
+                } else {
+                    val reason = bhttpReadErr ?: "EOF / sin cabecera HTTP inmediata"
+                    VpnStateHolder.appendLog(
+                        "BHTTP",
+                        "BHTTP ${profile.host}:${profile.port} sin respuesta en ${bhttpMs}ms ($reason); manteniendo túnel activo",
                         LogLevel.WARNING
                     )
                 }
@@ -353,7 +363,7 @@ class JeffersVpnService : VpnService() {
         sessionStartedAt = System.currentTimeMillis()
         VpnStateHolder.appendLog(
             "TUN",
-            "Túnel 10.8.0.2/32 MTU $activeMtu activo • DNS $activeDnsPrimary / $activeDnsSecondary",
+            "TUN 10.8.0.2/32 + fd00:10:8::2/128 MTU $activeMtu activo • DNS $activeDnsPrimary / $activeDnsSecondary",
             LogLevel.SUCCESS
         )
 
@@ -398,10 +408,12 @@ class JeffersVpnService : VpnService() {
 
         var prevRx = initialRxBytes
         var prevTx = initialTxBytes
+        var tickCount = 0
 
         try {
             while (serviceScope.isActive && relayJob.isActive && !userInitiatedStop) {
                 delay(1000L)
+                tickCount++
                 val now = System.currentTimeMillis()
                 val currentRx = initialRxBytes + relay.rxBytes.get()
                 val currentTx = initialTxBytes + relay.txBytes.get()
@@ -418,6 +430,13 @@ class JeffersVpnService : VpnService() {
                         rxBytesPerSec = rxSpeed,
                         txBytesPerSec = txSpeed,
                         durationSeconds = elapsedSec
+                    )
+                }
+                if (tickCount == 1 || tickCount % 2 == 0) {
+                    VpnStateHolder.recordMonitorSample(
+                        rxBytesPerSec = rxSpeed,
+                        txBytesPerSec = txSpeed,
+                        pingMs = VpnStateHolder.telemetry.value.pingMs
                     )
                 }
             }
@@ -474,6 +493,13 @@ class JeffersVpnService : VpnService() {
                 rxBytesPerSec = 0L,
                 txBytesPerSec = 0L,
                 statusMessage = message
+            )
+        }
+        VpnStateHolder.updateDiagnostics {
+            it.copy(
+                tunnelMode = "Inactivo",
+                activeTcpSessions = 0,
+                activeUdpSessions = 0
             )
         }
     }

@@ -803,3 +803,52 @@ data class PingTestResult(
     val httpBanner: String?,
     val errorDetail: String?
 )
+
+enum class DiagnosticCheckStatus {
+    PASS,
+    WARN,
+    FAIL
+}
+
+data class NetworkDiagnosticCheck(
+    val id: String,
+    val title: String,
+    val detail: String,
+    val status: DiagnosticCheckStatus,
+    val latencyMs: Int? = null
+)
+
+data class NetworkDiagnosticReport(
+    val checkedAtMillis: Long = System.currentTimeMillis(),
+    val summary: String,
+    val recommendedAction: String,
+    val overallStatus: DiagnosticCheckStatus,
+    val checks: List<NetworkDiagnosticCheck>
+)
+
+data class TunnelMonitorSample(
+    val timestampMillis: Long,
+    val rxBytesPerSec: Long,
+    val txBytesPerSec: Long,
+    val pingMs: Int?,
+    val dnsOkCount: Int,
+    val tcpOkCount: Int,
+    val errorCount: Int
+)
+
+data class TunnelDiagnosticsState(
+    val tunnelMode: String = "Inactivo",
+    val dnsOkCount: Int = 0,
+    val dnsFailCount: Int = 0,
+    val lastDnsDetail: String? = null,
+    val tcpOkCount: Int = 0,
+    val tcpFailCount: Int = 0,
+    val lastTcpDetail: String? = null,
+    val sshFailCount: Int = 0,
+    val lastSshDetail: String? = null,
+    val ipv6RejectedCount: Int = 0,
+    val orphanRstCount: Int = 0,
+    val activeTcpSessions: Int = 0,
+    val activeUdpSessions: Int = 0
+)
+
