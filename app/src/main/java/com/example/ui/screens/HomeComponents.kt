@@ -72,6 +72,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.model.PlanTier
 import com.example.data.model.ServerAnimationStyle
@@ -231,7 +232,7 @@ internal fun HomeTopBar(
                                     border = BorderStroke(0.8.dp, ChampagneGold.copy(alpha = 0.72f))
                                 ) {
                                     Text(
-                                        text = "✦ NAVIDAD PRO",
+                                        text = "✦ NAVIDAD PRO • v${BuildConfig.VERSION_NAME}",
                                         style = MonoTypography.terminal.copy(
                                             fontSize = 8.5.sp,
                                             fontWeight = FontWeight.Bold,
@@ -243,7 +244,7 @@ internal fun HomeTopBar(
                                 }
                             } else {
                                 Text(
-                                    text = "ULTRA EDITION",
+                                    text = "ULTRA • v${BuildConfig.VERSION_NAME}",
                                     style = MonoTypography.terminal.copy(fontSize = 9.sp),
                                     color = primaryColor
                                 )

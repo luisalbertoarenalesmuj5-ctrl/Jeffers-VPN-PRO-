@@ -67,12 +67,26 @@ class SshTunnelClient(
         for (pwd in passwordsToTry) {
             var candidateSession: Session? = null
             try {
+                JSch.setLogger(object : com.jcraft.jsch.Logger {
+                    override fun isEnabled(level: Int): Boolean = level >= com.jcraft.jsch.Logger.WARN
+                    override fun log(level: Int, message: String?) {
+                        if (!message.isNullOrBlank()) {
+                            try {
+                                android.util.Log.w("JeffersSSH", message)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                })
                 val jsch = JSch()
                 val created = jsch.getSession(username.ifBlank { "root" }, host, port)
                 candidateSession = created
                 created.setPassword(pwd)
                 created.setConfig("StrictHostKeyChecking", "no")
                 created.setConfig("PreferredAuthentications", "password,keyboard-interactive")
+                created.setConfig("PubkeyAuthentication", "no")
+                created.setConfig("compression.s2c", "none")
+                created.setConfig("compression.c2s", "none")
                 created.setServerAliveInterval(15_000)
                 created.setServerAliveCountMax(3)
                 created.setTimeout(15_000)

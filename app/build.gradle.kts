@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.jeffersvpn.jvpnxk"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 10
+    versionName = "1.0.9.10"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

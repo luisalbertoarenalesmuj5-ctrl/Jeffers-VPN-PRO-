@@ -102,6 +102,32 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun `buildIpv4IcmpPortUnreachablePacket builds valid IPv4 ICMP Type 3 Code 3 packet`() {
+        val originalUdp = TunPacketRelay.buildIpv4UdpPacket(
+            srcIp = byteArrayOf(10, 8, 0, 2),
+            dstIp = byteArrayOf(142.toByte(), 250.toByte(), 190.toByte(), 78),
+            srcPort = 51000,
+            dstPort = 443,
+            payload = byteArrayOf(0x01, 0x02, 0x03, 0x04)
+        )
+        val icmp = TunPacketRelay.buildIpv4IcmpPortUnreachablePacket(originalUdp, 20)
+        assertNotNull(icmp)
+        icmp!!
+        assertEquals(20 + 8 + 28, icmp.size)
+        assertEquals(1.toByte(), icmp[9]) // Protocol = ICMP
+        assertEquals(3.toByte(), icmp[20]) // Type 3
+        assertEquals(3.toByte(), icmp[21]) // Code 3
+        assertEquals(0, onesComplementSum(icmp, 0, 20))
+        assertEquals(0, onesComplementSum(icmp, 20, 8 + 28))
+    }
+
+    @Test
+    fun `app version matches 1_0_9_10`() {
+        assertEquals("1.0.9.10", BuildConfig.VERSION_NAME)
+        assertEquals(10, BuildConfig.VERSION_CODE)
+    }
+
+    @Test
     fun `admin password verification succeeds for default ultra-hard password and rejects wrong input`() {
         val ultraDefault = "Jv#8Qx!4Lp@9Zr%2Km&7Tn*5W^3B"
         val hash = LicenseCodeEngine.hashAdminPassword(ultraDefault)

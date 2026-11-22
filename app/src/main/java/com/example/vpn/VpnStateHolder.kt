@@ -1,5 +1,6 @@
 package com.example.vpn
 
+import com.example.BuildConfig
 import com.example.data.model.LogLevel
 import com.example.data.model.VpnConnectionStatus
 import com.example.data.model.VpnLogEntry
@@ -27,7 +28,7 @@ object VpnStateHolder {
                 id = logIdCounter.getAndIncrement(),
                 timestamp = timeFormat.format(Date()),
                 tag = "CORE",
-                message = "Jeffers VPN listo • VPSpremiumPRO (192.6.154.212)",
+                message = "Jeffers VPN v${BuildConfig.VERSION_NAME} listo • VPSpremiumPRO (192.6.154.212)",
                 level = LogLevel.INFO
             )
         )

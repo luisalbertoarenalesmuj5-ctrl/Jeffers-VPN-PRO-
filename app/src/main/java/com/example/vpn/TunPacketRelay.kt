@@ -319,7 +319,7 @@ class TunPacketRelay(
 
         if (isRst) {
             closeTcpSession(session)
-            tcpSessions.remove(key)
+            tcpSessions.remove(key, session)
             return
         }
 
@@ -425,11 +425,14 @@ class TunPacketRelay(
                 username = vpsUsername,
                 candidatePasswords = sshCandidatePasswords
             )
-            val result = candidate.connect(2500)
+            val result = candidate.connect(4500)
             if (result.isSuccess) {
                 ownedFallbackSshClient?.disconnect()
                 ownedFallbackSshClient = candidate
                 activeSshClient = candidate
+                VpnStateHolder.updateTelemetry {
+                    it.copy(statusMessage = "Túnel SSH activo • $vpsHost:22")
+                }
                 VpnStateHolder.appendLog(
                     "SSH",
                     "Puerto $vpsPort sin proxy HTTP CONNECT; túnel SSH activo vía $vpsHost:22 ($vpsUsername)",
@@ -437,6 +440,13 @@ class TunPacketRelay(
                 )
                 candidate
             } else {
+                val err = result.exceptionOrNull()
+                val errMsg = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Sin respuesta"
+                VpnStateHolder.appendLog(
+                    "SSH",
+                    "Respaldo SSH en $vpsHost:22 no disponible ($errMsg)",
+                    LogLevel.WARNING
+                )
                 candidate.disconnect()
                 sshFallbackCooldownUntil = System.currentTimeMillis() + 120_000L
                 null
@@ -520,6 +530,9 @@ class TunPacketRelay(
                 }
                 if (proxySocket != null) {
                     activeUpstream = SocketUpstreamStream(proxySocket)
+                    VpnStateHolder.updateTelemetry {
+                        it.copy(statusMessage = "Proxy HTTP CONNECT activo • $vpsHost:$vpsPort")
+                    }
                 } else {
                     ensureSshFallbackConnected()?.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { stream ->
                         activeUpstream = SshUpstreamStream(stream)
@@ -531,6 +544,9 @@ class TunPacketRelay(
             if (activeUpstream == null) {
                 if (!loggedDirectFallback && vpsPort != 22 && initialSshClient == null) {
                     loggedDirectFallback = true
+                    VpnStateHolder.updateTelemetry {
+                        it.copy(statusMessage = "Red directa protegida (sin proxy/SSH en VPS)")
+                    }
                     VpnStateHolder.appendLog(
                         "RELAY",
                         "Puerto $vpsPort no actúa como proxy HTTP CONNECT; enrutando tráfico por socket protegido",
@@ -626,7 +642,7 @@ class TunPacketRelay(
             closeSessionWithRst(session, output)
         } finally {
             closeTcpSession(session)
-            tcpSessions.remove(session.key)
+            tcpSessions.remove(session.key, session)
         }
     }
 
@@ -724,7 +740,7 @@ class TunPacketRelay(
             sendTcpControlPacket(session, FLAG_RST or FLAG_ACK, ByteArray(0), output)
         }
         closeTcpSession(session)
-        tcpSessions.remove(session.key)
+        tcpSessions.remove(session.key, session)
     }
 
     private fun sendTcpControlPacket(
@@ -789,6 +805,15 @@ class TunPacketRelay(
         val payloadLength = (udpLength - 8).coerceAtMost(packet.size - payloadOffset)
         if (payloadLength <= 0 || payloadLength > maxUdpPayload) return
 
+        // When SSH tunnel is active (TCP-only direct-tcpip), reject QUIC/UDP with ICMP Port Unreachable
+        // so browsers and apps switch immediately to TCP/HTTPS through the SSH tunnel instead of stalling.
+        if (activeSshClient?.isConnected() == true) {
+            buildIpv4IcmpPortUnreachablePacket(packet, ihlBytes)?.let { icmpPacket ->
+                writePacketToTun(icmpPacket, output)
+            }
+            return
+        }
+
         val srcIp = packet.copyOfRange(12, 16)
         val dstIp = packet.copyOfRange(16, 20)
         val srcPort = readUShort(packet, udpOffset)
@@ -850,7 +875,7 @@ class TunPacketRelay(
                     } finally {
                         created.closed = true
                         try { sock.close() } catch (_: Exception) {}
-                        udpSessions.remove(key)
+                        udpSessions.remove(key, created)
                     }
                 }
             }
@@ -867,7 +892,7 @@ class TunPacketRelay(
         }
     }
 
-    private fun forwardDnsQueryWithFailover(
+    private suspend fun forwardDnsQueryWithFailover(
         requestPacket: ByteArray,
         ihlBytes: Int,
         output: FileOutputStream
@@ -886,22 +911,28 @@ class TunPacketRelay(
 
         val candidates = listOf(dnsPrimaryIp, dnsSecondaryIp, "8.8.8.8", "1.1.1.1").distinct()
 
-        // When an SSH tunnel is active, resolve DNS over TCP through the VPS SSH tunnel first
+        // When an SSH tunnel is active, resolve DNS over TCP through the VPS SSH tunnel with hard 1s read timeout
         val ssh = activeSshClient?.takeIf { it.isConnected() }
         if (ssh != null) {
             for (dnsIp in candidates.take(2)) {
                 var sshDns: SshTcpStream? = null
+                var timeoutJob: Job? = null
                 try {
                     sshDns = ssh.openDirectTcpIp(dnsIp, DNS_PORT, 1000)
                     if (sshDns != null) {
+                        val activeChannel = sshDns
+                        timeoutJob = scope.launch(Dispatchers.IO) {
+                            kotlinx.coroutines.delay(1000L)
+                            activeChannel.close()
+                        }
                         val framedQuery = ByteArray(2 + dnsPayload.size)
                         framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
                         framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
                         System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
-                        sshDns.outputStream.write(framedQuery)
-                        sshDns.outputStream.flush()
+                        activeChannel.outputStream.write(framedQuery)
+                        activeChannel.outputStream.flush()
 
-                        val inStream = sshDns.inputStream
+                        val inStream = activeChannel.inputStream
                         val lenHi = inStream.read()
                         val lenLo = inStream.read()
                         if (lenHi >= 0 && lenLo >= 0) {
@@ -930,6 +961,7 @@ class TunPacketRelay(
                     }
                 } catch (_: Exception) {
                 } finally {
+                    timeoutJob?.cancel()
                     sshDns?.close()
                 }
             }
@@ -1039,6 +1071,7 @@ class TunPacketRelay(
     }
 
     companion object {
+        private const val PROTOCOL_ICMP = 1
         private const val PROTOCOL_TCP = 6
         private const val PROTOCOL_UDP = 17
         private const val DNS_PORT = 53
@@ -1062,6 +1095,49 @@ class TunPacketRelay(
                 ((data[offset + 1].toLong() and 0xFF) shl 16) or
                 ((data[offset + 2].toLong() and 0xFF) shl 8) or
                 (data[offset + 3].toLong() and 0xFF)
+
+        fun buildIpv4IcmpPortUnreachablePacket(
+            originalPacket: ByteArray,
+            originalIhlBytes: Int
+        ): ByteArray? {
+            val quotedLen = (originalIhlBytes + 8).coerceAtMost(originalPacket.size)
+            if (quotedLen < 28) return null
+            val ipHeaderLen = 20
+            val icmpLen = 8 + quotedLen
+            val totalLen = ipHeaderLen + icmpLen
+            val buf = ByteBuffer.allocate(totalLen)
+
+            val origSrcIp = originalPacket.copyOfRange(12, 16)
+            val origDstIp = originalPacket.copyOfRange(16, 20)
+
+            buf.put(0x45.toByte())
+            buf.put(0x00.toByte())
+            buf.putShort(totalLen.toShort())
+            buf.putShort(0x0000.toShort())
+            buf.putShort(0x4000.toShort())
+            buf.put(64.toByte())
+            buf.put(PROTOCOL_ICMP.toByte())
+            buf.putShort(0.toShort())
+            buf.put(origDstIp)
+            buf.put(origSrcIp)
+
+            buf.put(3.toByte()) // Type 3: Destination Unreachable
+            buf.put(3.toByte()) // Code 3: Port Unreachable
+            buf.putShort(0.toShort()) // Checksum placeholder
+            buf.putInt(0) // Unused 4 bytes
+            buf.put(originalPacket, 0, quotedLen)
+
+            val arr = buf.array()
+            val ipChecksum = computeChecksum(arr, 0, ipHeaderLen)
+            arr[10] = ((ipChecksum ushr 8) and 0xFF).toByte()
+            arr[11] = (ipChecksum and 0xFF).toByte()
+
+            val icmpChecksum = computeChecksum(arr, ipHeaderLen, icmpLen)
+            arr[ipHeaderLen + 2] = ((icmpChecksum ushr 8) and 0xFF).toByte()
+            arr[ipHeaderLen + 3] = (icmpChecksum and 0xFF).toByte()
+
+            return arr
+        }
 
         fun buildIpv4UdpPacket(
             srcIp: ByteArray,
