@@ -35,6 +35,23 @@ class ExampleUnitTest {
         assertTrue(masked.contains("•"))
     }
 
+    private fun onesComplementSum(bytes: ByteArray, offset: Int, length: Int, seed: Long = 0L): Int {
+        var sum = seed
+        var i = offset
+        val end = offset + length
+        while (i + 1 < end) {
+            sum += ((bytes[i].toInt() and 0xFF) shl 8) or (bytes[i + 1].toInt() and 0xFF)
+            i += 2
+        }
+        if (i < end) {
+            sum += (bytes[i].toInt() and 0xFF) shl 8
+        }
+        while ((sum ushr 16) != 0L) {
+            sum = (sum and 0xFFFF) + (sum ushr 16)
+        }
+        return (sum.inv() and 0xFFFF).toInt()
+    }
+
     @Test
     fun `buildIpv4UdpPacket constructs valid IPv4 header and UDP payload`() {
         val srcIp = byteArrayOf(1, 1, 1, 1)
@@ -52,6 +69,9 @@ class ExampleUnitTest {
         assertEquals(0x45.toByte(), packet[0])
         assertEquals(17.toByte(), packet[9])
         assertEquals(0x12.toByte(), packet[28])
+        assertEquals(0, onesComplementSum(packet, 0, 20))
+        val udpSeed = (1L shl 8 or 1L) + (1L shl 8 or 1L) + (10L shl 8 or 8L) + (0L shl 8 or 2L) + 17L + (8 + payload.size)
+        assertEquals(0, onesComplementSum(packet, 20, 8 + payload.size, udpSeed))
     }
 
     @Test
@@ -76,6 +96,9 @@ class ExampleUnitTest {
         assertEquals(0x18.toByte(), packet[33])
         assertEquals('O'.code.toByte(), packet[40])
         assertEquals('K'.code.toByte(), packet[41])
+        assertEquals(0, onesComplementSum(packet, 0, 20))
+        val tcpSeed = ((192L shl 8) or 6L) + ((154L shl 8) or 212L) + ((10L shl 8) or 8L) + 2L + 6L + (20 + payload.size)
+        assertEquals(0, onesComplementSum(packet, 20, 20 + payload.size, tcpSeed))
     }
 
     @Test
