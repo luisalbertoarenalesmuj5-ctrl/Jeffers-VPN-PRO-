@@ -929,24 +929,8 @@ class TunPacketRelay internal constructor(
         }
     }
 
-    private fun readHttpHeadersExact(input: java.io.InputStream): String? {
-        val bytes = ByteArray(4096)
-        var count = 0
-        while (count < bytes.size) {
-            val b = input.read()
-            if (b < 0) return null
-            bytes[count++] = b.toByte()
-            if (count >= 4 &&
-                bytes[count - 4] == '\r'.code.toByte() &&
-                bytes[count - 3] == '\n'.code.toByte() &&
-                bytes[count - 2] == '\r'.code.toByte() &&
-                bytes[count - 1] == '\n'.code.toByte()
-            ) {
-                return String(bytes, 0, count, Charsets.UTF_8)
-            }
-        }
-        return null
-    }
+    private fun readHttpHeadersExact(input: java.io.InputStream): String? =
+        VpsReachabilityTester.readHttpHeadersExact(input)
 
     private fun sendTcpSynAckPacket(session: TcpSession, mss: Int, output: OutputStream) {
         val packet = synchronized(session.seqLock) {

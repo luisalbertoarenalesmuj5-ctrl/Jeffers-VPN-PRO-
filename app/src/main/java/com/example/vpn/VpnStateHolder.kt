@@ -41,7 +41,7 @@ object VpnStateHolder {
                 id = logIdCounter.getAndIncrement(),
                 timestamp = timeFormat.format(Date()),
                 tag = "CORE",
-                message = "Jeffers VPN v${BuildConfig.VERSION_NAME} listo • VPSpremiumPRO (192.6.154.212)",
+                message = "Jeffers VPN v${BuildConfig.VERSION_NAME} (HTTP CONNECT + SSH) listo • VPSpremiumPRO (192.6.154.212)",
                 level = LogLevel.INFO
             )
         )
