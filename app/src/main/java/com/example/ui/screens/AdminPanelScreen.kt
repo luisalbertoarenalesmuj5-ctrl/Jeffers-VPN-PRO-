@@ -138,6 +138,10 @@ fun AdminPanelScreen(
         sniHost: String,
         bhttpPayload: String
     ) -> Unit,
+    onTestProfile: (VpnProfileEntity) -> Unit = {},
+    onVerifyAllServers: () -> Unit = {},
+    onSwitchProfileProtocol: (VpnProfileEntity, TunnelProtocol) -> Unit = { _, _ -> },
+    onEnableHttpConnectAll: () -> Unit = {},
     onSyncCloudLicenses: () -> Unit = {},
     onClearAdminFeedback: () -> Unit = {},
     isLinkingGoogle: Boolean = false,
@@ -272,7 +276,11 @@ fun AdminPanelScreen(
                             profile.sniHost,
                             profile.bhttpPayload
                         )
-                    }
+                    },
+                    onTestProfile = onTestProfile,
+                    onVerifyAllServers = onVerifyAllServers,
+                    onSwitchProfileProtocol = onSwitchProfileProtocol,
+                    onEnableHttpConnectAll = onEnableHttpConnectAll
                 )
             } else if (adminSection == 2) {
                 AdminVpsAnalysisSection(

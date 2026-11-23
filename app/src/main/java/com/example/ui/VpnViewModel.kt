@@ -24,6 +24,7 @@ import com.example.data.model.NetworkDiagnosticReport
 import com.example.data.model.PingTestResult
 import com.example.data.model.PlanTier
 import com.example.data.model.ServerAnimationStyle
+import com.example.data.model.ServerVerificationState
 import com.example.data.model.ThemePreset
 import com.example.data.model.TunnelDiagnosticsState
 import com.example.data.model.TunnelMonitorSample
@@ -51,17 +52,23 @@ import com.example.vpn.VpsAnalysisReport
 import com.example.vpn.VpsAnalyzerEngine
 import com.example.vpn.VpsReachabilityTester
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.util.Locale
 
 data class VpnDashboardUiState(
@@ -78,7 +85,9 @@ data class VpnDashboardUiState(
     val diagnostics: TunnelDiagnosticsState = TunnelDiagnosticsState(),
     val monitorSamples: List<TunnelMonitorSample> = emptyList(),
     val diagnosticReport: NetworkDiagnosticReport? = null,
-    val isRunningDiagnostic: Boolean = false
+    val isRunningDiagnostic: Boolean = false,
+    val serverStatuses: Map<Long, ServerVerificationState> = emptyMap(),
+    val isVerifyingAllServers: Boolean = false
 )
 
 private data class DiagnosticUiBundle(
@@ -97,6 +106,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private val _isTestingPing = MutableStateFlow(false)
     private val _testingProfileId = MutableStateFlow<Long?>(null)
     private val _lastPingResult = MutableStateFlow<PingTestResult?>(null)
+    private val _isVerifyingAllServers = MutableStateFlow(false)
     private val _isRunningDiagnostic = MutableStateFlow(false)
     private val _diagnosticReport = MutableStateFlow<NetworkDiagnosticReport?>(null)
 
@@ -179,6 +189,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             diagnosticReport = bundle.diagnosticReport,
             isRunningDiagnostic = bundle.isRunningDiagnostic
         )
+    }.combine(VpnStateHolder.serverStatuses) { state, serverStatuses ->
+        state.copy(serverStatuses = serverStatuses)
+    }.combine(_isVerifyingAllServers) { state, verifyingAll ->
+        state.copy(isVerifyingAllServers = verifyingAll)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5000L),
@@ -193,6 +207,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 syncTelemetryWithProfile(active)
             }
             checkDeviceLicenseBinding()
+            verifyAllConfiguredServers(silentLog = true)
         }
 
         viewModelScope.launch {
@@ -784,7 +799,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val activeTier = settingsStore.settings.value.activeSubscription.effectiveTier()
             val requiredTier = PlanTier.fromName(profile.tier)
-            if (!activeTier.unlocksServerTier(requiredTier)) {
+            if (profile.isPreset && !activeTier.unlocksServerTier(requiredTier)) {
                 VpnStateHolder.appendLog(
                     "PLAN",
                     "Servidor '${profile.profileName}' requiere ${requiredTier.displayName} (plan actual: ${activeTier.badgeLabel}).",
@@ -795,6 +810,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val currentStatus = VpnStateHolder.telemetry.value.status
             repository.selectProfile(profile.id)
             if (currentStatus == VpnConnectionStatus.DISCONNECTED || currentStatus == VpnConnectionStatus.ERROR) {
+                if (currentStatus == VpnConnectionStatus.ERROR) {
+                    VpnStateHolder.setStatus(VpnConnectionStatus.DISCONNECTED, null)
+                }
                 syncTelemetryWithProfile(profile)
             }
             val currentSettings = settingsStore.settings.value
@@ -803,7 +821,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
             VpnStateHolder.appendLog(
                 "PERFIL",
-                "Servidor activo: ${profile.profileName} (${profile.host}:${profile.port})",
+                "Servidor activo: ${profile.profileName} (${profile.host}:${profile.port} • ${profile.protocol})",
                 LogLevel.INFO
             )
         }
@@ -967,34 +985,129 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isTestingPing.value = true
             _testingProfileId.value = profile.id
+            VpnStateHolder.markServerChecking(profile.id)
             VpnStateHolder.appendLog(
                 "TEST",
-                "Probando TCP + BHTTP hacia ${profile.host}:${profile.port}…",
+                "Verificando ${profile.profileName} (${profile.host}:${profile.port} • ${profile.protocol})…",
                 LogLevel.INFO
             )
             val result = VpsReachabilityTester.testProfile(profile)
             _lastPingResult.value = result
+            val currentTelemetry = VpnStateHolder.telemetry.value
+            val isConnectedTunnel = currentTelemetry.status == VpnConnectionStatus.CONNECTED &&
+                currentTelemetry.activeProfileId == profile.id
             if (result.isReachable) {
                 repository.updateLatency(profile.id, result.latencyMs)
+                val channel = result.verifiedChannel ?: profile.protocol
+                VpnStateHolder.markServerVerificationResult(
+                    profileId = profile.id,
+                    isConnectedTunnel = isConnectedTunnel,
+                    isReachable = true,
+                    latencyMs = result.latencyMs,
+                    channelLabel = channel,
+                    detail = result.httpBanner ?: "VPS activo • $channel (${result.latencyMs ?: 1} ms)"
+                )
                 val s = settingsStore.settings.value
                 if (s.christmasSoundsEnabled) {
                     ChristmasSoundEngine.playTestSuccessBell(s.christmasSoundStyle)
                 }
                 VpnStateHolder.appendLog(
                     "TEST",
-                    "OK ${profile.host}:${profile.port} en ${result.latencyMs} ms • ${result.httpBanner}",
+                    "OK ${profile.host}:${profile.port} ($channel) en ${result.latencyMs} ms • ${result.httpBanner}",
                     LogLevel.SUCCESS
                 )
             } else {
                 repository.updateLatency(profile.id, null)
+                val errText = result.errorDetail ?: "Sin respuesta válida del túnel"
+                VpnStateHolder.markServerVerificationResult(
+                    profileId = profile.id,
+                    isConnectedTunnel = false,
+                    isReachable = false,
+                    latencyMs = null,
+                    channelLabel = null,
+                    detail = errText
+                )
+                if (currentTelemetry.activeProfileId == profile.id &&
+                    currentTelemetry.status != VpnConnectionStatus.CONNECTED
+                ) {
+                    VpnStateHolder.updateTelemetry { it.copy(pingMs = null) }
+                }
                 VpnStateHolder.appendLog(
                     "TEST",
-                    "Sin respuesta en ${profile.host}:${profile.port}: ${result.errorDetail}",
+                    "Fallo en ${profile.host}:${profile.port}: $errText",
                     LogLevel.ERROR
                 )
             }
             _isTestingPing.value = false
             _testingProfileId.value = null
+        }
+    }
+
+    fun verifyAllConfiguredServers(silentLog: Boolean = false) {
+        if (_isVerifyingAllServers.value) return
+        viewModelScope.launch {
+            _isVerifyingAllServers.value = true
+            try {
+                val profilesToCheck = uiState.value.profiles.ifEmpty { repository.profiles.first() }
+                if (profilesToCheck.isEmpty()) return@launch
+
+                if (!silentLog) {
+                    VpnStateHolder.appendLog(
+                        "TEST",
+                        "Comprobando estado real de ${profilesToCheck.size} servidor(es) VPS…",
+                        LogLevel.INFO
+                    )
+                }
+                profilesToCheck.forEach { VpnStateHolder.markServerChecking(it.id) }
+
+                val limiter = Semaphore(3)
+                val results = coroutineScope {
+                    profilesToCheck.map { profile ->
+                        async {
+                            limiter.withPermit {
+                                val res = VpsReachabilityTester.testProfile(profile)
+                                val telemetryNow = VpnStateHolder.telemetry.value
+                                val isConnectedTunnel = telemetryNow.status == VpnConnectionStatus.CONNECTED &&
+                                    telemetryNow.activeProfileId == profile.id
+                                if (res.isReachable) {
+                                    repository.updateLatency(profile.id, res.latencyMs)
+                                    val channel = res.verifiedChannel ?: profile.protocol
+                                    VpnStateHolder.markServerVerificationResult(
+                                        profileId = profile.id,
+                                        isConnectedTunnel = isConnectedTunnel,
+                                        isReachable = true,
+                                        latencyMs = res.latencyMs,
+                                        channelLabel = channel,
+                                        detail = res.httpBanner ?: "VPS activo • $channel (${res.latencyMs ?: 1} ms)"
+                                    )
+                                } else {
+                                    repository.updateLatency(profile.id, null)
+                                    VpnStateHolder.markServerVerificationResult(
+                                        profileId = profile.id,
+                                        isConnectedTunnel = false,
+                                        isReachable = false,
+                                        latencyMs = null,
+                                        channelLabel = null,
+                                        detail = res.errorDetail ?: "Error de conexión"
+                                    )
+                                }
+                                profile to res
+                            }
+                        }
+                    }.awaitAll()
+                }
+
+                val activeCount = results.count { it.second.isReachable }
+                if (!silentLog || activeCount < results.size) {
+                    VpnStateHolder.appendLog(
+                        "TEST",
+                        "Verificación VPS completa: $activeCount de ${results.size} activo(s)",
+                        if (activeCount > 0) LogLevel.SUCCESS else LogLevel.WARNING
+                    )
+                }
+            } finally {
+                _isVerifyingAllServers.value = false
+            }
         }
     }
 
@@ -1060,6 +1173,55 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "Perfil guardado (${tier.badgeLabel}) en ${country.displayName}: $cleanName ($cleanHost:$port)",
                 LogLevel.SUCCESS
             )
+        }
+    }
+
+    fun switchProfileProtocol(profile: VpnProfileEntity, newProtocol: TunnelProtocol) {
+        viewModelScope.launch {
+            repository.updateProfileProtocol(profile.id, newProtocol)
+            val updated = profile.copy(protocol = newProtocol.name)
+            val currentTelemetry = VpnStateHolder.telemetry.value
+            if (currentTelemetry.activeProfileId == profile.id &&
+                currentTelemetry.status != VpnConnectionStatus.CONNECTED
+            ) {
+                syncTelemetryWithProfile(updated)
+            }
+            VpnStateHolder.appendLog(
+                "PROXY",
+                "Protocolo de '${profile.profileName}' cambiado a ${newProtocol.displayName} (IP/credenciales intactas)",
+                LogLevel.INFO
+            )
+            testProfileLatency(updated)
+        }
+    }
+
+    fun switchAllProfilesToHttpConnect() {
+        viewModelScope.launch {
+            val profiles = uiState.value.profiles.ifEmpty { repository.profiles.first() }
+            if (profiles.isEmpty()) return@launch
+            var updatedCount = 0
+            profiles.forEach { profile ->
+                if (profile.protocol != TunnelProtocol.HTTP_CONNECT.name) {
+                    repository.updateProfileProtocol(profile.id, TunnelProtocol.HTTP_CONNECT)
+                    updatedCount++
+                }
+            }
+            val selectedNow = repository.getSelectedProfile()
+            val telemetryNow = VpnStateHolder.telemetry.value
+            if (selectedNow != null && telemetryNow.status != VpnConnectionStatus.CONNECTED) {
+                syncTelemetryWithProfile(selectedNow)
+            }
+            _adminFeedback.value = true to if (updatedCount > 0) {
+                "Protocolo HTTP CONNECT activado en $updatedCount servidor(es) sin modificar credenciales."
+            } else {
+                "Todos tus servidores ya están en modo HTTP CONNECT."
+            }
+            VpnStateHolder.appendLog(
+                "PROXY",
+                "Modo HTTP CONNECT aplicado a ${profiles.size} servidor(es) VPS; verificando proxies…",
+                LogLevel.SUCCESS
+            )
+            verifyAllConfiguredServers(silentLog = false)
         }
     }
 

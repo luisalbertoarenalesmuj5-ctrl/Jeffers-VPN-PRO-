@@ -2,6 +2,8 @@ package com.example.vpn
 
 import com.example.BuildConfig
 import com.example.data.model.LogLevel
+import com.example.data.model.ServerStatus
+import com.example.data.model.ServerVerificationState
 import com.example.data.model.TunnelDiagnosticsState
 import com.example.data.model.TunnelMonitorSample
 import com.example.data.model.VpnConnectionStatus
@@ -30,6 +32,9 @@ object VpnStateHolder {
     private val _monitorSamples = MutableStateFlow<List<TunnelMonitorSample>>(emptyList())
     val monitorSamples: StateFlow<List<TunnelMonitorSample>> = _monitorSamples.asStateFlow()
 
+    private val _serverStatuses = MutableStateFlow<Map<Long, ServerVerificationState>>(emptyMap())
+    val serverStatuses: StateFlow<Map<Long, ServerVerificationState>> = _serverStatuses.asStateFlow()
+
     private val _logs = MutableStateFlow<List<VpnLogEntry>>(
         listOf(
             VpnLogEntry(
@@ -49,6 +54,112 @@ object VpnStateHolder {
 
     fun updateDiagnostics(transform: (TunnelDiagnosticsState) -> TunnelDiagnosticsState) {
         _diagnostics.update(transform)
+    }
+
+    fun updateServerStatus(
+        profileId: Long,
+        transform: (ServerVerificationState) -> ServerVerificationState
+    ) {
+        if (profileId <= 0L) return
+        _serverStatuses.update { current ->
+            val prev = current[profileId] ?: ServerVerificationState(profileId = profileId)
+            current + (profileId to transform(prev))
+        }
+    }
+
+    fun markServerChecking(profileId: Long) {
+        updateServerStatus(profileId) { prev ->
+            prev.copy(
+                isChecking = true,
+                detail = "Verificando IP, puerto, credenciales y protocolo…"
+            )
+        }
+    }
+
+    fun markServerVerificationResult(
+        profileId: Long,
+        isConnectedTunnel: Boolean,
+        isReachable: Boolean,
+        latencyMs: Int?,
+        channelLabel: String?,
+        detail: String
+    ) {
+        updateServerStatus(profileId) { prev ->
+            prev.copy(
+                status = when {
+                    isConnectedTunnel -> ServerStatus.CONNECTED
+                    isReachable -> ServerStatus.DISCONNECTED
+                    else -> ServerStatus.ERROR
+                },
+                isChecking = false,
+                isReachable = isReachable,
+                latencyMs = latencyMs,
+                activeChannelLabel = channelLabel,
+                detail = detail,
+                checkedAtMillis = System.currentTimeMillis()
+            )
+        }
+    }
+
+    fun markConnectedServer(profileId: Long, latencyMs: Int?, channelLabel: String) {
+        _serverStatuses.update { current ->
+            val updated = current.mapValues { (id, state) ->
+                if (id != profileId && state.status == ServerStatus.CONNECTED) {
+                    state.copy(
+                        status = if (state.isReachable == false) ServerStatus.ERROR else ServerStatus.DISCONNECTED
+                    )
+                } else {
+                    state
+                }
+            }.toMutableMap()
+            val prev = updated[profileId] ?: ServerVerificationState(profileId = profileId)
+            updated[profileId] = prev.copy(
+                status = ServerStatus.CONNECTED,
+                isChecking = false,
+                isReachable = true,
+                latencyMs = latencyMs ?: prev.latencyMs,
+                activeChannelLabel = channelLabel,
+                detail = "Túnel verificado • $channelLabel${(latencyMs ?: prev.latencyMs)?.let { " (${it} ms)" }.orEmpty()}",
+                checkedAtMillis = System.currentTimeMillis()
+            )
+            updated
+        }
+    }
+
+    fun markServerDisconnected(profileId: Long?) {
+        _serverStatuses.update { current ->
+            current.mapValues { (id, state) ->
+                if ((profileId == null || id == profileId) && state.status == ServerStatus.CONNECTED) {
+                    state.copy(
+                        status = if (state.isReachable == false) ServerStatus.ERROR else ServerStatus.DISCONNECTED,
+                        isChecking = false,
+                        detail = if (state.isReachable == true) {
+                            val ch = state.activeChannelLabel?.let { " • $it" }.orEmpty()
+                            val rtt = state.latencyMs?.let { " • ${it} ms" }.orEmpty()
+                            "VPS activo$ch$rtt"
+                        } else {
+                            "Desconectado"
+                        }
+                    )
+                } else {
+                    state
+                }
+            }
+        }
+    }
+
+    fun markServerError(profileId: Long?, detail: String) {
+        if (profileId == null || profileId <= 0L) return
+        updateServerStatus(profileId) { prev ->
+            prev.copy(
+                status = ServerStatus.ERROR,
+                isChecking = false,
+                isReachable = false,
+                latencyMs = null,
+                detail = detail,
+                checkedAtMillis = System.currentTimeMillis()
+            )
+        }
     }
 
     fun resetDiagnostics() {

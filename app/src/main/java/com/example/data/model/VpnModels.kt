@@ -796,12 +796,30 @@ data class VpnTelemetry(
     val statusMessage: String? = null
 )
 
+enum class ServerStatus(val label: String) {
+    CONNECTED("Conectado"),
+    DISCONNECTED("Desconectado"),
+    ERROR("Error")
+}
+
+data class ServerVerificationState(
+    val profileId: Long,
+    val status: ServerStatus = ServerStatus.DISCONNECTED,
+    val isChecking: Boolean = false,
+    val isReachable: Boolean? = null,
+    val latencyMs: Int? = null,
+    val activeChannelLabel: String? = null,
+    val detail: String = "Sin verificar",
+    val checkedAtMillis: Long? = null
+)
+
 data class PingTestResult(
     val profileId: Long,
     val isReachable: Boolean,
     val latencyMs: Int?,
     val httpBanner: String?,
-    val errorDetail: String?
+    val errorDetail: String?,
+    val verifiedChannel: String? = null
 )
 
 enum class DiagnosticCheckStatus {

@@ -225,6 +225,13 @@ fun HomeScreen(
                                 )
                             }
 
+                            val activeVerification = activeProfile?.let { uiState.serverStatuses[it.id] }
+                            val resolvedServerStatus = when {
+                                telemetry.status == VpnConnectionStatus.CONNECTED -> com.example.data.model.ServerStatus.CONNECTED
+                                telemetry.status == VpnConnectionStatus.ERROR -> com.example.data.model.ServerStatus.ERROR
+                                activeVerification != null -> activeVerification.status
+                                else -> com.example.data.model.ServerStatus.DISCONNECTED
+                            }
                             OnlineServersCard(
                                 surfaceColor = glassSurfaceColor,
                                 primaryColor = primaryColor,
@@ -236,9 +243,14 @@ fun HomeScreen(
                                 ).flagEmoji,
                                 activeServerTitle = activeProfile?.profileName ?: "Seleccionar servidor",
                                 protocolBadge = activeProfile?.protocol ?: "BHTTP",
-                                pingMs = telemetry.pingMs ?: activeProfile?.lastLatencyMs,
+                                pingMs = if (resolvedServerStatus == com.example.data.model.ServerStatus.ERROR) null
+                                else (telemetry.pingMs ?: activeVerification?.latencyMs ?: activeProfile?.lastLatencyMs),
                                 activeTier = effectiveTier,
                                 animationStyle = settings.serverAnimation,
+                                serverStatus = resolvedServerStatus,
+                                isCheckingServer = activeVerification?.isChecking == true ||
+                                    (activeProfile != null && uiState.testingProfileId == activeProfile.id),
+                                serverStatusDetail = activeVerification?.detail ?: telemetry.statusMessage,
                                 onClick = onOpenCountries
                             )
 
@@ -321,6 +333,13 @@ fun HomeScreen(
                             Spacer(modifier = Modifier.height(12.dp))
                         }
 
+                        val activeVerificationCompact = activeProfile?.let { uiState.serverStatuses[it.id] }
+                        val resolvedServerStatusCompact = when {
+                            telemetry.status == VpnConnectionStatus.CONNECTED -> com.example.data.model.ServerStatus.CONNECTED
+                            telemetry.status == VpnConnectionStatus.ERROR -> com.example.data.model.ServerStatus.ERROR
+                            activeVerificationCompact != null -> activeVerificationCompact.status
+                            else -> com.example.data.model.ServerStatus.DISCONNECTED
+                        }
                         OnlineServersCard(
                             surfaceColor = glassSurfaceColor,
                             primaryColor = primaryColor,
@@ -332,9 +351,14 @@ fun HomeScreen(
                             ).flagEmoji,
                             activeServerTitle = activeProfile?.profileName ?: "Seleccionar servidor",
                             protocolBadge = activeProfile?.protocol ?: "BHTTP",
-                            pingMs = telemetry.pingMs ?: activeProfile?.lastLatencyMs,
+                            pingMs = if (resolvedServerStatusCompact == com.example.data.model.ServerStatus.ERROR) null
+                            else (telemetry.pingMs ?: activeVerificationCompact?.latencyMs ?: activeProfile?.lastLatencyMs),
                             activeTier = effectiveTier,
                             animationStyle = settings.serverAnimation,
+                            serverStatus = resolvedServerStatusCompact,
+                            isCheckingServer = activeVerificationCompact?.isChecking == true ||
+                                (activeProfile != null && uiState.testingProfileId == activeProfile.id),
+                            serverStatusDetail = activeVerificationCompact?.detail ?: telemetry.statusMessage,
                             onClick = onOpenCountries
                         )
 

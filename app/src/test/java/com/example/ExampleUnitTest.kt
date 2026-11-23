@@ -952,6 +952,366 @@ class ExampleUnitTest {
             relayThread.join(1000)
         }
     }
+
+    @Test
+    fun `vpsReachabilityTester rejects HTTP 302 redirect and accepts real CONNECT 204 proxy with bound protect socket`() = runTest {
+        // 1. Server returning HTTP/1.1 302 Found (must fail end-to-end verification)
+        val redirectServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val redirectPort = redirectServer.localPort
+        val redirectThread = thread(start = true) {
+            try {
+                while (!redirectServer.isClosed) {
+                    val client = redirectServer.accept()
+                    client.soTimeout = 1000
+                    try {
+                        client.getInputStream().read(ByteArray(1024))
+                        client.getOutputStream().write(
+                            "HTTP/1.1 302 Found\r\nLocation: http://portal.tigo.com/\r\nContent-Length: 0\r\n\r\n"
+                                .toByteArray(Charsets.UTF_8)
+                        )
+                        client.getOutputStream().flush()
+                    } catch (_: Exception) {
+                    } finally {
+                        client.close()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val sawBoundSocket = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            val redirectProfile = com.example.data.local.VpnProfileEntity(
+                id = 101L,
+                profileName = "Test 302",
+                vpsName = "VPS",
+                host = "127.0.0.1",
+                port = redirectPort,
+                username = "root",
+                password = "",
+                carrier = com.example.data.model.CarrierType.TIGO.name,
+                protocol = com.example.data.model.TunnelProtocol.HTTP_CONNECT.name,
+                sniHost = "m.tigo.com",
+                bhttpPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf][crlf]"
+            )
+            val failResult = com.example.vpn.VpsReachabilityTester.testProfile(
+                profile = redirectProfile,
+                timeoutMs = 2000,
+                protectSocket = { sock ->
+                    if (sock.isBound) sawBoundSocket.set(true)
+                    sock.isBound
+                }
+            )
+            assertTrue("Expected socket to be bound before protect()", sawBoundSocket.get())
+            assertFalse("HTTP 302 redirect must NOT pass verification", failResult.isReachable)
+            assertTrue(
+                "Expected error detail to mention 302, got: ${failResult.errorDetail}",
+                failResult.errorDetail.orEmpty().contains("302")
+            )
+        } finally {
+            try { redirectServer.close() } catch (_: Exception) {}
+            redirectThread.join(1000)
+        }
+
+        // 2. Real HTTP CONNECT proxy forwarding connectivitycheck.gstatic.com:80 -> 204
+        val proxyServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val proxyPort = proxyServer.localPort
+        val proxyThread = thread(start = true) {
+            try {
+                while (!proxyServer.isClosed) {
+                    val client = proxyServer.accept()
+                    thread(start = true) {
+                        try {
+                            client.soTimeout = 2000
+                            val inStream = client.getInputStream()
+                            val hdr = com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(inStream).orEmpty()
+                            if (hdr.startsWith("CONNECT ")) {
+                                client.getOutputStream().write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+                                client.getOutputStream().flush()
+                                val innerReq = com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(inStream).orEmpty()
+                                if (innerReq.startsWith("GET /generate_204")) {
+                                    client.getOutputStream().write("HTTP/1.1 204 No Content\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                }
+                            }
+                            client.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            val okProfile = com.example.data.local.VpnProfileEntity(
+                id = 102L,
+                profileName = "Test CONNECT 204",
+                vpsName = "VPS",
+                host = "127.0.0.1",
+                port = proxyPort,
+                username = "root",
+                password = "secret",
+                carrier = com.example.data.model.CarrierType.TIGO.name,
+                protocol = com.example.data.model.TunnelProtocol.BHTTP.name,
+                sniHost = "m.tigo.com",
+                bhttpPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf][crlf]"
+            )
+            val passResult = com.example.vpn.VpsReachabilityTester.testProfile(
+                profile = okProfile,
+                timeoutMs = 2500,
+                protectSocket = { sock -> sock.isBound }
+            )
+            assertTrue("Expected real HTTP CONNECT + 204 probe to pass: ${passResult.errorDetail}", passResult.isReachable)
+            assertNotNull(passResult.latencyMs)
+            assertTrue(passResult.verifiedChannel.orEmpty().contains("CONNECT"))
+        } finally {
+            try { proxyServer.close() } catch (_: Exception) {}
+            proxyThread.join(1000)
+        }
+    }
+
+    @Test
+    fun `tunPacketRelay with allowDirectFallback false resets TCP instead of bypassing to direct socket`() {
+        val directTargetServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val targetPort = directTargetServer.localPort
+        val directConnectionCount = java.util.concurrent.atomic.AtomicInteger(0)
+        val targetThread = thread(start = true) {
+            try {
+                while (!directTargetServer.isClosed) {
+                    val client = directTargetServer.accept()
+                    directConnectionCount.incrementAndGet()
+                    client.close()
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val brokenProxyServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val brokenProxyPort = brokenProxyServer.localPort
+        val brokenProxyThread = thread(start = true) {
+            try {
+                while (!brokenProxyServer.isClosed) {
+                    val client = brokenProxyServer.accept()
+                    try {
+                        client.getInputStream().read(ByteArray(512))
+                        client.getOutputStream().write("HTTP/1.1 302 Found\r\n\r\n".toByteArray())
+                        client.getOutputStream().flush()
+                    } catch (_: Exception) {
+                    } finally {
+                        client.close()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        val tunToRelay = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayToTun = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
+
+        val relay = TunPacketRelay(
+            protectSocket = { sock -> sock.isBound },
+            protectDatagramSocket = { true },
+            tunInputProvider = { PacketQueueInputStream(tunToRelay) },
+            tunOutputProvider = { PacketQueueOutputStream(relayToTun) },
+            dnsPrimaryIp = "127.0.0.1",
+            dnsSecondaryIp = "127.0.0.1",
+            vpsHost = "127.0.0.1",
+            vpsPort = brokenProxyPort,
+            vpsUsername = "root",
+            vpsPassword = "secret",
+            sshCandidatePasswords = emptyList(),
+            initialSshClient = null,
+            scope = relayScope,
+            mtu = 1400,
+            initialProxyVerified = false,
+            allowDirectFallback = false,
+            sshClientFactory = null,
+            onLog = { _, _, _ -> },
+            onStatusMessage = {}
+        )
+        val relayThread = thread(start = true) { relay.runLoop() }
+
+        try {
+            tunToRelay.offer(
+                TunPacketRelay.buildIpv4TcpPacket(
+                    srcIp = byteArrayOf(10, 8, 0, 2),
+                    dstIp = byteArrayOf(127, 0, 0, 1),
+                    srcPort = 56123,
+                    dstPort = targetPort,
+                    seqNum = 9000L,
+                    ackNum = 0L,
+                    flags = 0x02,
+                    payload = ByteArray(0)
+                )
+            )
+            val rstPkt = relayToTun.poll(4, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull("Expected TCP RST when allowDirectFallback = false and proxy returns 302", rstPkt)
+            assertEquals(0x04, rstPkt!![33].toInt() and 0x04)
+            assertEquals(0, directConnectionCount.get())
+        } finally {
+            tunToRelay.offer(ByteArray(0))
+            relay.closeAllSessions()
+            relayScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            try { brokenProxyServer.close() } catch (_: Exception) {}
+            try { directTargetServer.close() } catch (_: Exception) {}
+            targetThread.join(1000)
+            brokenProxyThread.join(1000)
+            relayThread.join(1000)
+        }
+    }
+
+    @Test
+    fun `vpnStateHolder tracks per-server Conectado, Desconectado, and Error states accurately`() {
+        val srv1 = 9101L
+        val srv2 = 9102L
+
+        com.example.vpn.VpnStateHolder.markServerChecking(srv1)
+        assertTrue(com.example.vpn.VpnStateHolder.serverStatuses.value[srv1]?.isChecking == true)
+
+        com.example.vpn.VpnStateHolder.markServerVerificationResult(
+            profileId = srv1,
+            isConnectedTunnel = false,
+            isReachable = true,
+            latencyMs = 42,
+            channelLabel = "SSH :22",
+            detail = "VPS activo"
+        )
+        assertEquals(
+            com.example.data.model.ServerStatus.DISCONNECTED,
+            com.example.vpn.VpnStateHolder.serverStatuses.value[srv1]?.status
+        )
+
+        com.example.vpn.VpnStateHolder.markConnectedServer(srv1, 42, "SSH :22")
+        assertEquals(
+            com.example.data.model.ServerStatus.CONNECTED,
+            com.example.vpn.VpnStateHolder.serverStatuses.value[srv1]?.status
+        )
+
+        com.example.vpn.VpnStateHolder.markServerError(srv2, "Puerto 8080 devolvió HTTP 302")
+        assertEquals(
+            com.example.data.model.ServerStatus.ERROR,
+            com.example.vpn.VpnStateHolder.serverStatuses.value[srv2]?.status
+        )
+
+        com.example.vpn.VpnStateHolder.markServerDisconnected(srv1)
+        assertEquals(
+            com.example.data.model.ServerStatus.DISCONNECTED,
+            com.example.vpn.VpnStateHolder.serverStatuses.value[srv1]?.status
+        )
+        assertEquals(
+            com.example.data.model.ServerStatus.ERROR,
+            com.example.vpn.VpnStateHolder.serverStatuses.value[srv2]?.status
+        )
+    }
+
+    @Test
+    fun `httpConnectSshSocketFactory tunnels 127_0_0_1_22 and probeHttpConnectProxy retries cleanly on strict proxy`() {
+        val mockSshBanner = "SSH-2.0-OpenSSH_8.9p1\r\n"
+        val sshOnlyProxyServer = ServerSocket(0, 5, java.net.InetAddress.getByName("127.0.0.1"))
+        val proxyPort = sshOnlyProxyServer.localPort
+        val seenConnectTargets = java.util.Collections.synchronizedList(mutableListOf<String>())
+
+        val serverThread = thread(start = true) {
+            try {
+                while (!sshOnlyProxyServer.isClosed) {
+                    val client = sshOnlyProxyServer.accept()
+                    thread(start = true) {
+                        try {
+                            client.soTimeout = 2000
+                            val inStream = client.getInputStream()
+                            val hdr = com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(inStream).orEmpty()
+                            val firstLine = hdr.lineSequence().firstOrNull().orEmpty()
+                            seenConnectTargets.add(firstLine)
+                            when {
+                                hdr.contains("X-VPS-Auth:") -> {
+                                    // Simulate strict Squid/Python proxy rejecting custom header with 400
+                                    client.getOutputStream().write("HTTP/1.1 400 Bad Request\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                }
+                                firstLine.startsWith("CONNECT 127.0.0.1:22") -> {
+                                    client.getOutputStream().write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                    client.getOutputStream().write(mockSshBanner.toByteArray(Charsets.UTF_8))
+                                    client.getOutputStream().flush()
+                                }
+                                firstLine.startsWith("CONNECT connectivitycheck.gstatic.com:80") -> {
+                                    client.getOutputStream().write("HTTP/1.1 200 Connection established\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                    val inner = com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(inStream).orEmpty()
+                                    if (inner.startsWith("GET /generate_204")) {
+                                        client.getOutputStream().write("HTTP/1.1 204 No Content\r\n\r\n".toByteArray())
+                                        client.getOutputStream().flush()
+                                    }
+                                }
+                                else -> {
+                                    client.getOutputStream().write("HTTP/1.1 403 Forbidden\r\n\r\n".toByteArray())
+                                    client.getOutputStream().flush()
+                                }
+                            }
+                            client.close()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            val profile = com.example.data.local.VpnProfileEntity(
+                id = 501L,
+                profileName = "Proxy Test",
+                vpsName = "VPS",
+                host = "127.0.0.1",
+                port = proxyPort,
+                username = "root",
+                password = "secret",
+                carrier = com.example.data.model.CarrierType.TIGO.name,
+                protocol = com.example.data.model.TunnelProtocol.HTTP_CONNECT.name,
+                sniHost = "m.tigo.com",
+                bhttpPayload = ""
+            )
+
+            // 1. Strict proxy rejects X-VPS-Auth with 400, then retries cleanly and passes HTTP 204 check
+            val openCheck = com.example.vpn.VpsReachabilityTester.probeHttpConnectProxy(
+                host = "127.0.0.1",
+                port = proxyPort,
+                username = "root",
+                password = "secret",
+                protectSocket = { sock -> sock.isBound },
+                timeoutMs = 2500,
+                sniHost = "m.tigo.com"
+            )
+            assertTrue("Expected clean retry without custom auth header to pass: ${openCheck.errorDetail}", openCheck.supported)
+
+            // 2. SSH-over-HTTP-CONNECT socket factory upgrades CONNECT 127.0.0.1:22 and delivers SSH banner
+            val factory = com.example.vpn.VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                profile = profile,
+                protectSocket = { sock -> sock.isBound },
+                timeoutMs = 2500,
+                onLog = { _, _, _ -> }
+            )
+            val upgraded = factory.createSocket("127.0.0.1", proxyPort)
+            try {
+                assertEquals(30_000, upgraded.soTimeout)
+                val banner = upgraded.getInputStream().bufferedReader().readLine()
+                assertEquals("SSH-2.0-OpenSSH_8.9p1", banner)
+            } finally {
+                upgraded.close()
+            }
+
+            assertTrue(seenConnectTargets.any { it.startsWith("CONNECT 127.0.0.1:22") })
+        } finally {
+            try { sshOnlyProxyServer.close() } catch (_: Exception) {}
+            serverThread.join(1000)
+        }
+    }
 }
+
+
 
 

@@ -27,9 +27,11 @@ import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Bolt
 import androidx.compose.material.icons.rounded.CellTower
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.NetworkCheck
 import androidx.compose.material.icons.rounded.RadioButtonUnchecked
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.WorkspacePremium
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -66,6 +68,8 @@ import com.example.data.local.VpnProfileEntity
 import com.example.data.model.CarrierType
 import com.example.data.model.CountryRegion
 import com.example.data.model.PlanTier
+import com.example.data.model.ServerStatus
+import com.example.data.model.ServerVerificationState
 import com.example.data.model.TunnelProtocol
 import com.example.data.model.VpnConnectionStatus
 import com.example.ui.VpnDashboardUiState
@@ -80,12 +84,16 @@ import com.example.ui.theme.ObsidianGlassElevated
 import com.example.ui.theme.ObsidianVoid
 import com.example.ui.theme.OutlineSubtle
 import com.example.ui.theme.PulseAmber
+import com.example.ui.theme.TextMuted
 
 @Composable
 fun CountriesListScreen(
     uiState: VpnDashboardUiState,
     onBack: () -> Unit,
     onOpenCountry: (CountryRegion) -> Unit,
+    onSelectProfile: (VpnProfileEntity) -> Unit = {},
+    onTestProfile: (VpnProfileEntity) -> Unit = {},
+    onVerifyAllServers: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val countsByCountry = remember(uiState.profiles) {
@@ -93,6 +101,8 @@ fun CountriesListScreen(
             uiState.profiles.count { CountryRegion.fromName(it.country) == region }
         }
     }
+    val isLockedByConnection = uiState.telemetry.status == VpnConnectionStatus.CONNECTED ||
+        uiState.telemetry.status == VpnConnectionStatus.CONNECTING
 
     Box(
         modifier = modifier
@@ -122,8 +132,8 @@ fun CountriesListScreen(
                         .widthIn(max = 820.dp)
                 ) {
                     SubScreenTopBar(
-                        title = "Servidores por País",
-                        subtitle = "${uiState.profiles.size} nodo(s) VIP • Toca un país para ver compañías",
+                        title = "Servidores VPS y Países",
+                        subtitle = "${uiState.profiles.size} servidor(es) VPS configurados • Verificación en tiempo real",
                         onBack = onBack
                     )
                     Spacer(modifier = Modifier.height(8.dp))
@@ -133,6 +143,110 @@ fun CountriesListScreen(
                         contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
                         modifier = Modifier.fillMaxSize()
                     ) {
+                        if (uiState.profiles.isNotEmpty()) {
+                            item(key = "configured_vps_header") {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 2.dp, bottom = 2.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "SERVIDORES VPS CONFIGURADOS (${uiState.profiles.size})",
+                                            style = MaterialTheme.typography.labelLarge.copy(
+                                                fontWeight = FontWeight.ExtraBold,
+                                                letterSpacing = 0.8.sp
+                                            ),
+                                            color = ChampagneGoldBright
+                                        )
+                                        Text(
+                                            text = if (isLockedByConnection) {
+                                                "Desconecta el túnel actual para cambiar de VPS"
+                                            } else {
+                                                "Toca cualquier VPS para seleccionarlo como servidor activo"
+                                            },
+                                            style = MonoTypography.terminal.copy(fontSize = 10.5.sp),
+                                            color = if (isLockedByConnection) PulseAmber else FrostIce.copy(alpha = 0.72f)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OutlinedButton(
+                                        onClick = onVerifyAllServers,
+                                        enabled = !uiState.isVerifyingAllServers,
+                                        border = BorderStroke(1.dp, ChampagneGold.copy(alpha = 0.55f)),
+                                        modifier = Modifier
+                                            .height(48.dp)
+                                            .testTag("verify_all_vps_button")
+                                    ) {
+                                        if (uiState.isVerifyingAllServers) {
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(16.dp),
+                                                strokeWidth = 2.dp,
+                                                color = ChampagneGoldBright
+                                            )
+                                        } else {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Refresh,
+                                                contentDescription = "Verificar todos los servidores VPS",
+                                                tint = ChampagneGoldBright,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = if (uiState.isVerifyingAllServers) "Probando…" else "Verificar",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = FrostIce
+                                        )
+                                    }
+                                }
+                            }
+
+                            items(
+                                items = uiState.profiles,
+                                key = { "configured_vps_${it.id}" }
+                            ) { profile ->
+                                val (status, verification) = resolveEffectiveServerStatus(profile, uiState)
+                                val isChecking = verification?.isChecking == true ||
+                                    uiState.testingProfileId == profile.id
+                                val isSelected = profile.id == uiState.selectedProfile?.id
+                                ConfiguredVpsStatusCard(
+                                    profile = profile,
+                                    serverStatus = status,
+                                    verificationState = verification,
+                                    isSelected = isSelected,
+                                    isChecking = isChecking,
+                                    isConnectionLocked = isLockedByConnection,
+                                    surfaceColor = if (isSelected) {
+                                        ObsidianGlassElevated.copy(alpha = 0.92f)
+                                    } else {
+                                        ObsidianGlass.copy(alpha = uiState.settings.cardAlpha.coerceIn(0.66f, 0.90f))
+                                    },
+                                    primaryColor = MaterialTheme.colorScheme.primary,
+                                    accentColor = MaterialTheme.colorScheme.secondary,
+                                    onSelect = {
+                                        onSelectProfile(profile)
+                                        onBack()
+                                    },
+                                    onVerify = { onTestProfile(profile) }
+                                )
+                            }
+
+                            item(key = "countries_section_header") {
+                                Text(
+                                    text = "EXPLORAR POR PAÍS Y OPERADORA",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        letterSpacing = 0.8.sp
+                                    ),
+                                    color = FrostIce.copy(alpha = 0.78f),
+                                    modifier = Modifier.padding(top = 8.dp, bottom = 2.dp)
+                                )
+                            }
+                        }
+
                         items(CountryRegion.entries, key = { it.name }) { region ->
                             val count = countsByCountry[region] ?: 0
                             CountryRowCard(
@@ -530,10 +644,13 @@ fun CountryServersScreen(
                                     if (matchingSaved != null) {
                                         matchedProfileIds += matchingSaved.id
                                         item(key = "saved_${planTier.name}_${slotIndex}_${matchingSaved.id}") {
+                                            val (srvStatus, srvVerification) = resolveEffectiveServerStatus(matchingSaved, uiState)
                                             ServerProfileCard(
                                                 profile = matchingSaved,
+                                                serverStatus = srvStatus,
+                                                verificationState = srvVerification,
                                                 isSelected = matchingSaved.id == uiState.selectedProfile?.id,
-                                                isTestingThis = uiState.testingProfileId == matchingSaved.id,
+                                                isTestingThis = uiState.testingProfileId == matchingSaved.id || srvVerification?.isChecking == true,
                                                 isConnectionLocked = isLockedByConnection,
                                                 isPlanUnlocked = planUnlocked,
                                                 surfaceColor = if (matchingSaved.id == uiState.selectedProfile?.id) {
@@ -544,7 +661,7 @@ fun CountryServersScreen(
                                                 primaryColor = primaryColor,
                                                 accentColor = accentColor,
                                                 onSelect = {
-                                                    if (planUnlocked) {
+                                                    if (planUnlocked || !matchingSaved.isPreset) {
                                                         onSelectProfile(matchingSaved)
                                                         onBack()
                                                     } else {
@@ -589,10 +706,13 @@ fun CountryServersScreen(
                                     items = extraSaved,
                                     key = { "extra_${planTier.name}_${it.id}" }
                                 ) { profile ->
+                                    val (srvStatus, srvVerification) = resolveEffectiveServerStatus(profile, uiState)
                                     ServerProfileCard(
                                         profile = profile,
+                                        serverStatus = srvStatus,
+                                        verificationState = srvVerification,
                                         isSelected = profile.id == uiState.selectedProfile?.id,
-                                        isTestingThis = uiState.testingProfileId == profile.id,
+                                        isTestingThis = uiState.testingProfileId == profile.id || srvVerification?.isChecking == true,
                                         isConnectionLocked = isLockedByConnection,
                                         isPlanUnlocked = planUnlocked,
                                         surfaceColor = if (profile.id == uiState.selectedProfile?.id) {
@@ -603,7 +723,7 @@ fun CountryServersScreen(
                                         primaryColor = primaryColor,
                                         accentColor = accentColor,
                                         onSelect = {
-                                            if (planUnlocked) {
+                                            if (planUnlocked || !profile.isPreset) {
                                                 onSelectProfile(profile)
                                                 onBack()
                                             } else {
@@ -917,6 +1037,8 @@ private fun CarrierQuickNodeCard(
 @Composable
 private fun ServerProfileCard(
     profile: VpnProfileEntity,
+    serverStatus: ServerStatus,
+    verificationState: ServerVerificationState?,
     isSelected: Boolean,
     isTestingThis: Boolean,
     isConnectionLocked: Boolean,
@@ -998,13 +1120,13 @@ private fun ServerProfileCard(
                             Box(contentAlignment = Alignment.Center) {
                                 Icon(
                                     imageVector = when {
-                                        !isPlanUnlocked -> Icons.Rounded.Lock
+                                        !isPlanUnlocked && profile.isPreset -> Icons.Rounded.Lock
                                         isSelected -> Icons.Rounded.CheckCircle
                                         else -> Icons.Rounded.RadioButtonUnchecked
                                     },
                                     contentDescription = if (isSelected) "Activo" else "Seleccionar",
                                     tint = when {
-                                        !isPlanUnlocked -> tierColor
+                                        !isPlanUnlocked && profile.isPreset -> tierColor
                                         isSelected -> accentColor
                                         else -> carrierColor
                                     },
@@ -1021,15 +1143,7 @@ private fun ServerProfileCard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = if (
-                                    protocol == TunnelProtocol.SSH_DIRECT ||
-                                    profile.port == 22 ||
-                                    CountryRegion.fromName(profile.country) == CountryRegion.GUATEMALA
-                                ) {
-                                    "${profile.username}@${profile.host}:${profile.port} • ${protocol.badge}"
-                                } else {
-                                    "${profile.host}:${profile.port} • ${protocol.badge}"
-                                },
+                                text = "${profile.username.ifBlank { "root" }}@${profile.host}:${profile.port} • ${protocol.badge}",
                                 style = MonoTypography.terminal.copy(fontSize = 11.5.sp),
                                 color = ChampagneGold.copy(alpha = 0.88f),
                                 maxLines = 1,
@@ -1040,32 +1154,22 @@ private fun ServerProfileCard(
 
                     Spacer(modifier = Modifier.width(8.dp))
 
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    Column(
+                        horizontalAlignment = Alignment.End,
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = tierColor.copy(alpha = 0.16f),
-                            border = BorderStroke(0.8.dp, tierColor.copy(alpha = 0.55f))
-                        ) {
-                            Text(
-                                text = profileTier.badgeLabel,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 9.5.sp,
-                                    fontWeight = FontWeight.Bold
-                                ),
-                                color = tierColor,
-                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
-                            )
-                        }
+                        ServerStatusBadge(
+                            status = serverStatus,
+                            isChecking = isTestingThis,
+                            accentColor = accentColor
+                        )
                         Surface(
                             shape = RoundedCornerShape(10.dp),
                             color = carrierColor.copy(alpha = 0.16f),
                             border = BorderStroke(0.9.dp, carrierColor.copy(alpha = 0.55f))
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                                modifier = Modifier.padding(horizontal = 9.dp, vertical = 3.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
@@ -1085,20 +1189,27 @@ private fun ServerProfileCard(
                     }
                 }
 
+                val statusLine = when {
+                    isTestingThis -> "Verificando protocolo, credenciales y salida…"
+                    verificationState != null -> verificationState.detail
+                    profile.lastLatencyMs != null -> "Última latencia verificada: ${profile.lastLatencyMs} ms"
+                    else -> "SNI: ${profile.sniHost}"
+                }
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = if (profile.lastLatencyMs != null) {
-                            "Latencia: ${profile.lastLatencyMs} ms"
-                        } else {
-                            "SNI: ${profile.sniHost}"
-                        },
+                        text = statusLine,
                         style = MaterialTheme.typography.bodySmall,
-                        color = if (profile.lastLatencyMs != null) accentColor else FrostIce.copy(alpha = 0.72f),
-                        maxLines = 1,
+                        color = when {
+                            serverStatus == ServerStatus.ERROR -> MaterialTheme.colorScheme.error
+                            serverStatus == ServerStatus.CONNECTED -> accentColor
+                            verificationState?.isReachable == true -> accentColor
+                            else -> FrostIce.copy(alpha = 0.72f)
+                        },
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f).padding(end = 8.dp)
                     )
@@ -1114,16 +1225,295 @@ private fun ServerProfileCard(
                         } else {
                             Icon(
                                 imageVector = Icons.Rounded.NetworkCheck,
-                                contentDescription = "Ping",
+                                contentDescription = "Verificar ${profile.profileName}",
                                 tint = ChampagneGoldBright,
                                 modifier = Modifier.size(16.dp)
                             )
                         }
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Ping", style = MaterialTheme.typography.labelMedium, color = FrostIce)
+                        Text("Verificar", style = MaterialTheme.typography.labelMedium, color = FrostIce)
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ConfiguredVpsStatusCard(
+    profile: VpnProfileEntity,
+    serverStatus: ServerStatus,
+    verificationState: ServerVerificationState?,
+    isSelected: Boolean,
+    isChecking: Boolean,
+    isConnectionLocked: Boolean,
+    surfaceColor: Color,
+    primaryColor: Color,
+    accentColor: Color,
+    onSelect: () -> Unit,
+    onVerify: () -> Unit
+) {
+    val region = CountryRegion.fromName(profile.country)
+    val protocol = TunnelProtocol.fromName(profile.protocol)
+    val carrier = CarrierType.fromName(profile.carrier)
+    val profileTier = PlanTier.fromName(profile.tier)
+    val tierColor = Color(profileTier.colorHex)
+
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = surfaceColor,
+        border = BorderStroke(
+            width = if (isSelected) 1.5.dp else 1.dp,
+            color = when {
+                serverStatus == ServerStatus.CONNECTED -> accentColor.copy(alpha = 0.85f)
+                isSelected -> ChampagneGoldBright.copy(alpha = 0.85f)
+                serverStatus == ServerStatus.ERROR -> MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+                else -> OutlineSubtle
+            }
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .clickable(enabled = !isConnectionLocked, onClick = onSelect)
+            .testTag("configured_vps_card_${profile.id}")
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = ObsidianGlassElevated,
+                        border = BorderStroke(
+                            1.2.dp,
+                            if (isSelected) ChampagneGoldBright else OutlineSubtle
+                        ),
+                        modifier = Modifier.size(38.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(text = region.flagEmoji, fontSize = 17.sp)
+                        }
+                    }
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = profile.profileName,
+                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (isSelected) ChampagneGoldBright else FrostIce,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            if (isSelected) {
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = ChampagneGold.copy(alpha = 0.18f),
+                                    border = BorderStroke(0.8.dp, ChampagneGold.copy(alpha = 0.65f))
+                                ) {
+                                    Text(
+                                        text = "SELECCIONADO",
+                                        style = MonoTypography.terminal.copy(fontSize = 8.5.sp, fontWeight = FontWeight.Bold),
+                                        color = ChampagneGoldBright,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                        }
+                        Text(
+                            text = "${profile.username.ifBlank { "root" }}@${profile.host}:${profile.port} • ${protocol.badge} • ${carrier.displayName}",
+                            style = MonoTypography.terminal.copy(fontSize = 11.sp),
+                            color = FrostIce.copy(alpha = 0.78f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                ServerStatusBadge(
+                    status = serverStatus,
+                    isChecking = isChecking,
+                    accentColor = accentColor
+                )
+            }
+
+            val detailText = when {
+                isChecking -> "Comprobando IP, puerto, protocolo y credenciales…"
+                verificationState != null -> verificationState.detail
+                profile.lastLatencyMs != null -> "Última verificación: ${profile.lastLatencyMs} ms"
+                else -> "Toca Verificar para probar este VPS en tiempo real"
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = detailText,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            serverStatus == ServerStatus.ERROR -> MaterialTheme.colorScheme.error
+                            serverStatus == ServerStatus.CONNECTED || verificationState?.isReachable == true -> accentColor
+                            else -> TextMuted
+                        },
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = "VPS: ${profile.vpsName}",
+                            style = MonoTypography.terminal.copy(fontSize = 10.sp),
+                            color = ChampagneGold.copy(alpha = 0.85f)
+                        )
+                        Text(
+                            text = "• ${profileTier.badgeLabel}",
+                            style = MonoTypography.terminal.copy(fontSize = 10.sp),
+                            color = tierColor
+                        )
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = onVerify,
+                    enabled = !isChecking,
+                    border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.55f)),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("verify_vps_button_${profile.id}")
+                ) {
+                    if (isChecking) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = primaryColor
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Rounded.NetworkCheck,
+                            contentDescription = "Probar ${profile.profileName}",
+                            tint = primaryColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Probar", style = MaterialTheme.typography.labelMedium, color = FrostIce)
+                }
+            }
+        }
+    }
+}
+
+internal fun resolveEffectiveServerStatus(
+    profile: VpnProfileEntity,
+    uiState: VpnDashboardUiState
+): Pair<ServerStatus, ServerVerificationState?> {
+    val verification = uiState.serverStatuses[profile.id]
+    val telemetry = uiState.telemetry
+    val isSelectedProfile = telemetry.activeProfileId == profile.id
+    val status = when {
+        isSelectedProfile && telemetry.status == VpnConnectionStatus.CONNECTED -> ServerStatus.CONNECTED
+        isSelectedProfile && telemetry.status == VpnConnectionStatus.ERROR -> ServerStatus.ERROR
+        verification?.status == ServerStatus.CONNECTED && !(isSelectedProfile && telemetry.status == VpnConnectionStatus.CONNECTED) ->
+            if (verification.isReachable == false) ServerStatus.ERROR else ServerStatus.DISCONNECTED
+        verification != null -> verification.status
+        else -> ServerStatus.DISCONNECTED
+    }
+    return status to verification
+}
+
+@Composable
+internal fun ServerStatusBadge(
+    status: ServerStatus,
+    isChecking: Boolean,
+    accentColor: Color,
+    modifier: Modifier = Modifier
+) {
+    val errorColor = MaterialTheme.colorScheme.error
+    val bg: Color
+    val border: Color
+    val fg: Color
+    val label: String
+    when {
+        isChecking -> {
+            bg = PulseAmber.copy(alpha = 0.16f)
+            border = PulseAmber.copy(alpha = 0.65f)
+            fg = PulseAmber
+            label = "Verificando"
+        }
+        status == ServerStatus.CONNECTED -> {
+            bg = accentColor.copy(alpha = 0.18f)
+            border = accentColor.copy(alpha = 0.72f)
+            fg = accentColor
+            label = ServerStatus.CONNECTED.label
+        }
+        status == ServerStatus.ERROR -> {
+            bg = errorColor.copy(alpha = 0.16f)
+            border = errorColor.copy(alpha = 0.70f)
+            fg = errorColor
+            label = ServerStatus.ERROR.label
+        }
+        else -> {
+            bg = Color(0x99121B22)
+            border = OutlineSubtle
+            fg = FrostIce.copy(alpha = 0.82f)
+            label = ServerStatus.DISCONNECTED.label
+        }
+    }
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = bg,
+        border = BorderStroke(1.dp, border),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            if (isChecking) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(10.dp),
+                    strokeWidth = 1.6.dp,
+                    color = fg
+                )
+            } else if (status == ServerStatus.ERROR) {
+                Icon(
+                    imageVector = Icons.Rounded.ErrorOutline,
+                    contentDescription = null,
+                    tint = fg,
+                    modifier = Modifier.size(12.dp)
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(fg)
+                )
+            }
+            Text(
+                text = label,
+                style = MonoTypography.terminal.copy(fontSize = 10.sp, fontWeight = FontWeight.Bold),
+                color = fg
+            )
         }
     }
 }

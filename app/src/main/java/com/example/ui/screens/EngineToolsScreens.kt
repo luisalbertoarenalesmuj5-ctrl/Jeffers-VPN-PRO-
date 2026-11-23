@@ -1866,9 +1866,18 @@ fun ProfileScreen(
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
+                                        val selectedNode = uiState.selectedProfile
+                                        val (nodeStatus, nodeVerification) = if (selectedNode != null) {
+                                            resolveEffectiveServerStatus(selectedNode, uiState)
+                                        } else {
+                                            com.example.data.model.ServerStatus.DISCONNECTED to null
+                                        }
+                                        val nodeChecking = nodeVerification?.isChecking == true ||
+                                            (selectedNode != null && uiState.testingProfileId == selectedNode.id)
                                         Row(
                                             verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            modifier = Modifier.weight(1f).padding(end = 8.dp)
                                         ) {
                                             Icon(
                                                 imageVector = Icons.Rounded.Shield,
@@ -1877,32 +1886,26 @@ fun ProfileScreen(
                                                 modifier = Modifier.size(18.dp)
                                             )
                                             Text(
-                                                text = uiState.selectedProfile?.vpsName ?: "VPSpremiumPRO",
+                                                text = selectedNode?.profileName ?: "VPSpremiumPRO",
                                                 style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                                color = FrostIce
+                                                color = FrostIce,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
                                         }
-                                        Surface(
-                                            shape = RoundedCornerShape(8.dp),
-                                            color = accentColor.copy(alpha = 0.16f),
-                                            border = BorderStroke(0.8.dp, accentColor.copy(alpha = 0.55f))
-                                        ) {
-                                            Text(
-                                                text = "ACTIVO",
-                                                style = MonoTypography.terminal.copy(
-                                                    fontSize = 9.5.sp,
-                                                    fontWeight = FontWeight.Bold
-                                                ),
-                                                color = accentColor,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                            )
-                                        }
+                                        ServerStatusBadge(
+                                            status = nodeStatus,
+                                            isChecking = nodeChecking,
+                                            accentColor = accentColor
+                                        )
                                     }
 
                                     Text(
-                                        text = "${uiState.profiles.size} nodo(s) listos • Protocolo BHTTP (Tigo :8080 / Claro :80)",
+                                        text = "${uiState.profiles.size} servidor(es) • ${uiState.selectedProfile?.protocol ?: "BHTTP"} :${uiState.selectedProfile?.port ?: 8080}${uiState.serverStatuses[uiState.selectedProfile?.id]?.detail?.let { " • $it" }.orEmpty()}",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = FrostIce.copy(alpha = 0.78f)
+                                        color = FrostIce.copy(alpha = 0.78f),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
                                     )
 
                                     Row(

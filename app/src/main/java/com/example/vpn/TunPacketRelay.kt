@@ -42,6 +42,9 @@ class TunPacketRelay internal constructor(
     private val initialSshClient: SshTunnelClient? = null,
     private val scope: CoroutineScope,
     private val mtu: Int = 1400,
+    private val initialProxyVerified: Boolean = false,
+    private val allowDirectFallback: Boolean = vpsHost.isBlank(),
+    private val proxySniHost: String = "",
     private val sshClientFactory: ((Int) -> SshTunnelClient)? = null,
     private val onLog: (String, String, LogLevel) -> Unit = { tag, msg, level ->
         VpnStateHolder.appendLog(tag, msg, level)
@@ -65,7 +68,9 @@ class TunPacketRelay internal constructor(
         sshCandidatePasswords: List<String> = listOf(vpsPassword),
         initialSshClient: SshTunnelClient? = null,
         scope: CoroutineScope,
-        mtu: Int = 1400
+        mtu: Int = 1400,
+        initialProxyVerified: Boolean = false,
+        allowDirectFallback: Boolean = false
     ) : this(
         protectSocket = { sock -> vpnService.protect(sock) },
         protectDatagramSocket = { sock -> vpnService.protect(sock) },
@@ -81,6 +86,8 @@ class TunPacketRelay internal constructor(
         initialSshClient = initialSshClient,
         scope = scope,
         mtu = mtu,
+        initialProxyVerified = initialProxyVerified,
+        allowDirectFallback = allowDirectFallback,
         sshClientFactory = {
             SshTunnelClient(
                 vpnService = vpnService,
@@ -118,7 +125,7 @@ class TunPacketRelay internal constructor(
     private var sshFallbackCooldownUntil: Long = 0L
 
     @Volatile
-    private var vpsSupportsConnect: Boolean = false
+    private var vpsSupportsConnect: Boolean = initialProxyVerified
 
     @Volatile
     private var vpsConnectCooldownUntil: Long = 0L
@@ -242,8 +249,10 @@ class TunPacketRelay internal constructor(
         }
 
         val initialMode = when {
-            activeSshClient?.isConnected() == true || vpsPort == 22 -> "SSH Directo ($vpsHost:22)"
-            vpsHost.isNotBlank() && vpsPort > 0 -> "BHTTP / Sondeando :$vpsPort"
+            activeSshClient?.isConnected() == true -> "SSH Túnel ($vpsHost:$vpsPort)"
+            vpsSupportsConnect -> "Proxy HTTP CONNECT ($vpsHost:$vpsPort)"
+            vpsPort == 22 -> "SSH Directo ($vpsHost:22)"
+            vpsHost.isNotBlank() && vpsPort > 0 -> "Sondeando :$vpsPort"
             else -> "Relay Local"
         }
         onDiagnostics {
@@ -255,11 +264,11 @@ class TunPacketRelay internal constructor(
         }
         onLog(
             "TUN",
-            "Relay TUN activo • MTU=$mtu MSS=$advertisedMss MaxUDP=$maxUdpPayload • DNS=$dnsPrimaryIp/$dnsSecondaryIp",
+            "Relay TUN activo • MTU=$mtu MSS=$advertisedMss MaxUDP=$maxUdpPayload • DNS=$dnsPrimaryIp/$dnsSecondaryIp • Modo=$initialMode",
             LogLevel.INFO
         )
 
-        if (activeSshClient == null && vpsPort != 22 && vpsHost.isNotBlank()) {
+        if (activeSshClient == null && !vpsSupportsConnect && vpsPort != 22 && vpsHost.isNotBlank()) {
             startupProbeJob = scope.launch(Dispatchers.IO) {
                 onLog("PROBE", "Sondeando soporte proxy HTTP CONNECT en $vpsHost:$vpsPort…", LogLevel.INFO)
                 val proxySocket = probeVpsConnectSupport("1.1.1.1", 443)
@@ -270,7 +279,10 @@ class TunPacketRelay internal constructor(
                     val ssh = ensureSshFallbackConnected()
                     if (ssh == null) {
                         onDiagnostics {
-                            it.copy(tunnelMode = "Directo protegido (sin proxy/SSH :$vpsPort)")
+                            it.copy(
+                                tunnelMode = if (allowDirectFallback) "Directo protegido"
+                                else "Sin túnel VPS (:$vpsPort)"
+                            )
                         }
                     }
                 }
@@ -627,78 +639,116 @@ class TunPacketRelay internal constructor(
         }
     }
 
+    private fun bindAndProtectTcpSocket(socket: Socket): Boolean {
+        try {
+            if (!socket.isBound) {
+                socket.bind(InetSocketAddress(0))
+            }
+        } catch (_: Exception) {
+        }
+        return protectSocket(socket)
+    }
+
+    private fun bindAndProtectUdpSocket(socket: DatagramSocket): Boolean {
+        try {
+            if (!socket.isBound) {
+                socket.bind(null)
+            }
+        } catch (_: Exception) {
+        }
+        return protectDatagramSocket(socket)
+    }
+
     private fun openProxyConnectSocket(dstHost: String, dstPort: Int): Socket? {
-        val proxySocket = Socket()
-        return try {
-            if (!protectSocket(proxySocket)) {
-                try { proxySocket.close() } catch (_: Exception) {}
-                onLog("PROXY", "No se pudo proteger socket proxy hacia $vpsHost:$vpsPort", LogLevel.WARNING)
-                return null
-            }
-            proxySocket.tcpNoDelay = true
-            proxySocket.keepAlive = true
-            val startNs = System.nanoTime()
-            proxySocket.connect(InetSocketAddress(vpsHost, vpsPort), 900)
-            proxySocket.soTimeout = 900
+        val headerModes = if (vpsUsername.isNotBlank() || vpsPassword.isNotBlank()) {
+            listOf(true, false)
+        } else {
+            listOf(false)
+        }
 
-            val connectReq = buildString {
-                append("CONNECT $dstHost:$dstPort HTTP/1.1\r\n")
-                append("Host: $dstHost:$dstPort\r\n")
-                append("X-VPS-Auth: $vpsPassword\r\n")
-                append("Proxy-Connection: Keep-Alive\r\n\r\n")
-            }
-            proxySocket.getOutputStream().write(connectReq.toByteArray(Charsets.UTF_8))
-            proxySocket.getOutputStream().flush()
+        var lastRtt = 1
+        var lastStatusLine: String? = null
+        var lastException: Exception? = null
 
-            val headerText = readHttpHeadersExact(proxySocket.getInputStream())
-            val rtt = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-            val statusLine = headerText?.lineSequence()?.firstOrNull()?.trim()
-            if (statusLine != null && statusLine.contains(" 200 ")) {
-                if (!vpsSupportsConnect) {
-                    onLog(
-                        "PROXY",
-                        "HTTP CONNECT $vpsHost:$vpsPort aceptado (${rtt}ms): $statusLine",
-                        LogLevel.SUCCESS
-                    )
+        for (includeAuthHeaders in headerModes) {
+            val proxySocket = Socket()
+            try {
+                if (!bindAndProtectTcpSocket(proxySocket)) {
+                    try { proxySocket.close() } catch (_: Exception) {}
+                    onLog("PROXY", "No se pudo proteger socket proxy hacia $vpsHost:$vpsPort", LogLevel.WARNING)
+                    return null
                 }
-                vpsSupportsConnect = true
-                proxySocket
-            } else {
+                proxySocket.tcpNoDelay = true
+                proxySocket.keepAlive = true
+                val startNs = System.nanoTime()
+                proxySocket.connect(InetSocketAddress(vpsHost, vpsPort), 3500)
+                proxySocket.soTimeout = 4000
+
+                val connectReq = buildString {
+                    append("CONNECT $dstHost:$dstPort HTTP/1.1\r\n")
+                    append("Host: $dstHost:$dstPort\r\n")
+                    if (proxySniHost.isNotBlank()) {
+                        append("X-Online-Host: $proxySniHost\r\n")
+                    }
+                    if (includeAuthHeaders && (vpsUsername.isNotBlank() || vpsPassword.isNotBlank())) {
+                        val creds = "${vpsUsername.ifBlank { "root" }}:$vpsPassword"
+                        append("Proxy-Authorization: Basic ${encodeBasicAuth(creds)}\r\n")
+                    }
+                    if (includeAuthHeaders && vpsPassword.isNotBlank()) {
+                        append("X-VPS-Auth: $vpsPassword\r\n")
+                    }
+                    append("Proxy-Connection: Keep-Alive\r\n\r\n")
+                }
+                proxySocket.getOutputStream().write(connectReq.toByteArray(Charsets.UTF_8))
+                proxySocket.getOutputStream().flush()
+
+                val headerText = readHttpHeadersExact(proxySocket.getInputStream())
+                lastRtt = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                lastStatusLine = headerText?.lineSequence()?.firstOrNull()?.trim()
+                val statusCode = parseHttpStatusCode(lastStatusLine)
+                if (statusCode in 200..299) {
+                    if (!vpsSupportsConnect) {
+                        onLog(
+                            "PROXY",
+                            "HTTP CONNECT $vpsHost:$vpsPort aceptado (${lastRtt}ms): $lastStatusLine",
+                            LogLevel.SUCCESS
+                        )
+                    }
+                    vpsSupportsConnect = true
+                    return proxySocket
+                }
                 try { proxySocket.close() } catch (_: Exception) {}
-                vpsSupportsConnect = false
-                vpsConnectCooldownUntil = System.currentTimeMillis() + 120_000L
-                val now = System.currentTimeMillis()
-                if (now - lastProxyFailLogAt.get() > 15_000L) {
-                    lastProxyFailLogAt.set(now)
-                    onLog(
-                        "PROXY",
-                        "HTTP CONNECT $vpsHost:$vpsPort sin túnel (${rtt}ms): ${statusLine ?: "EOF sin cabecera HTTP"}",
-                        LogLevel.WARNING
-                    )
+                if (statusCode !in setOf(400, 403)) {
+                    break
                 }
-                null
+            } catch (e: Exception) {
+                try { proxySocket.close() } catch (_: Exception) {}
+                lastException = e
+                break
             }
-        } catch (e: Exception) {
-            try { proxySocket.close() } catch (_: Exception) {}
+        }
+
+        if (!initialProxyVerified) {
             vpsSupportsConnect = false
             vpsConnectCooldownUntil = System.currentTimeMillis() + 120_000L
-            val now = System.currentTimeMillis()
-            if (now - lastProxyFailLogAt.get() > 15_000L) {
-                lastProxyFailLogAt.set(now)
-                onLog(
-                    "PROXY",
-                    "Error HTTP CONNECT $vpsHost:$vpsPort: ${e.localizedMessage ?: e.javaClass.simpleName}",
-                    LogLevel.WARNING
-                )
-            }
-            null
         }
+        val now = System.currentTimeMillis()
+        if (now - lastProxyFailLogAt.get() > 15_000L) {
+            lastProxyFailLogAt.set(now)
+            val detail = if (lastException != null) {
+                "Error HTTP CONNECT $vpsHost:$vpsPort: ${lastException.localizedMessage ?: lastException.javaClass.simpleName}"
+            } else {
+                "HTTP CONNECT $vpsHost:$vpsPort rechazó $dstHost:$dstPort (${lastRtt}ms): ${lastStatusLine ?: "EOF sin cabecera HTTP"}"
+            }
+            onLog("PROXY", detail, LogLevel.WARNING)
+        }
+        return null
     }
 
     private suspend fun connectAndBridgeTcpSession(session: TcpSession, output: OutputStream) {
         val dstHost = InetAddress.getByAddress(session.dstIp).hostAddress ?: return
         var activeUpstream: UpstreamTcpStream? = null
-        var transportLabel = "DIRECTO"
+        var transportLabel = if (allowDirectFallback) "DIRECTO" else "VPS"
         try {
             // 1. Prefer real SSH direct-tcpip tunnel when active
             var ssh = activeSshClient?.takeIf { it.isConnected() } ?: run {
@@ -718,10 +768,9 @@ class TunPacketRelay internal constructor(
                 }
             }
 
-            // If SSH is actively connected, do not bypass SSH to a direct socket when a destination refuses
             val sshConnectedNow = ssh?.isConnected() == true || activeSshClient?.isConnected() == true
 
-            // 2. Otherwise check HTTP CONNECT proxy on vpsHost:vpsPort (or fall back to SSH on :22)
+            // 2. Otherwise use verified HTTP CONNECT proxy on vpsHost:vpsPort (or fall back to SSH on :22)
             if (activeUpstream == null && !sshConnectedNow && vpsPort != 22 && initialSshClient == null) {
                 val proxySocket = if (vpsSupportsConnect) {
                     openProxyConnectSocket(dstHost, session.key.dstPort)
@@ -733,7 +782,7 @@ class TunPacketRelay internal constructor(
                     transportLabel = "HTTP-CONNECT"
                     onStatusMessage("Proxy HTTP CONNECT activo • $vpsHost:$vpsPort")
                     onDiagnostics { it.copy(tunnelMode = "Proxy HTTP CONNECT (:$vpsPort)") }
-                } else {
+                } else if (!initialProxyVerified) {
                     val fallbackSsh = ensureSshFallbackConnected()
                     if (fallbackSsh != null) {
                         fallbackSsh.openDirectTcpIp(dstHost, session.key.dstPort, 4500)?.let { stream ->
@@ -744,20 +793,10 @@ class TunPacketRelay internal constructor(
                 }
             }
 
-            // 3. Fallback to protected direct socket only when neither HTTP CONNECT nor SSH is connected
-            if (activeUpstream == null && activeSshClient?.isConnected() != true && !vpsSupportsConnect) {
-                if (!loggedDirectFallback && vpsPort != 22 && initialSshClient == null && vpsHost.isNotBlank()) {
-                    loggedDirectFallback = true
-                    onStatusMessage("Red directa protegida (sin proxy/SSH en VPS)")
-                    onDiagnostics { it.copy(tunnelMode = "Directo protegido (sin proxy/SSH :$vpsPort)") }
-                    onLog(
-                        "RELAY",
-                        "Puerto $vpsPort no actúa como proxy HTTP CONNECT ni SSH; enrutando tráfico por socket protegido",
-                        LogLevel.WARNING
-                    )
-                }
+            // 3. Direct fallback ONLY when explicitly allowed (local loopback tests without VPS host)
+            if (allowDirectFallback && activeUpstream == null && activeSshClient?.isConnected() != true && !vpsSupportsConnect) {
                 val directSocket = Socket()
-                if (!protectSocket(directSocket)) {
+                if (!bindAndProtectTcpSocket(directSocket)) {
                     throw java.io.IOException("No se pudo proteger el socket directo hacia $dstHost:${session.key.dstPort}")
                 }
                 directSocket.tcpNoDelay = true
@@ -768,7 +807,11 @@ class TunPacketRelay internal constructor(
             }
 
             val upstream = activeUpstream ?: run {
-                val errHint = activeSshClient?.lastErrorMessage ?: "Sin canal SSH/Proxy disponible"
+                val errHint = activeSshClient?.lastErrorMessage ?: if (vpsSupportsConnect) {
+                    "Proxy HTTP CONNECT rechazó $dstHost:${session.key.dstPort}"
+                } else {
+                    "Sin canal SSH/Proxy VPS disponible (fuga directa bloqueada)"
+                }
                 onDiagnostics {
                     it.copy(
                         tcpFailCount = it.tcpFailCount + 1,
@@ -780,7 +823,7 @@ class TunPacketRelay internal constructor(
                 val now = System.currentTimeMillis()
                 if (streak <= 3L || now - lastDirectFailureLogAt > 4000L) {
                     lastDirectFailureLogAt = now
-                    onLog("TCP", "Canal rechazado a $dstHost:${session.key.dstPort}: $errHint", LogLevel.ERROR)
+                    onLog("TCP", "Canal bloqueado a $dstHost:${session.key.dstPort}: $errHint", LogLevel.ERROR)
                 }
                 closeSessionWithRst(session, output)
                 return
@@ -1078,7 +1121,7 @@ class TunPacketRelay internal constructor(
             }
             val sock = try {
                 DatagramSocket().also {
-                    if (!protectDatagramSocket(it)) {
+                    if (!bindAndProtectUdpSocket(it)) {
                         it.close()
                         return
                     }
@@ -1250,155 +1293,125 @@ class TunPacketRelay internal constructor(
             return false
         }
 
+        fun emitDnsResponse(responsePayload: ByteArray, sourceLabel: String) {
+            val finalPayload = if (responsePayload.size <= maxUdpPayload) {
+                responsePayload
+            } else {
+                responsePayload.copyOf(512.coerceAtMost(maxUdpPayload)).also { tcResp ->
+                    if (tcResp.size > 2) tcResp[2] = (tcResp[2].toInt() or 0x02).toByte()
+                }
+            }
+            val ipPacket = buildIpv4UdpPacket(
+                srcIp = dstIp,
+                dstIp = srcIp,
+                srcPort = dstPort,
+                dstPort = srcPort,
+                payload = finalPayload
+            )
+            writePacketToTun(ipPacket, output)
+            val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
+            onDiagnostics {
+                it.copy(
+                    dnsOkCount = it.dnsOkCount + 1,
+                    lastDnsDetail = "$sourceLabel (${ms}ms)"
+                )
+            }
+            if (loggedFirstDnsOk.compareAndSet(false, true)) {
+                onLog("DNS", "DNS resuelto vía $sourceLabel (${ms}ms)", LogLevel.SUCCESS)
+            }
+        }
+
+        // 1. When SSH tunnel is active, resolve DNS over TCP through SSH direct-tcpip
         val initialSsh = activeSshClient?.takeIf { it.isConnected() }
         if (initialSsh != null && resolveDnsViaSsh(initialSsh)) {
             return
         }
 
-        for (dnsIp in candidates) {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket()
-                if (!protectDatagramSocket(socket)) {
-                    onLog("DNS", "No se pudo proteger socket UDP DNS", LogLevel.WARNING)
-                    return
-                }
-                socket.soTimeout = 750
-                val targetAddr = InetAddress.getByName(dnsIp)
-                socket.send(DatagramPacket(dnsPayload, dnsPayload.size, targetAddr, DNS_PORT))
+        // 2. When HTTP CONNECT proxy is active, resolve DNS via proxy TCP:53 or DoH:443 INSIDE the VPS tunnel
+        if (vpsSupportsConnect) {
+            for (dnsIp in candidates.take(2)) {
+                var tcpSocket: Socket? = null
+                try {
+                    tcpSocket = openProxyConnectSocket(dnsIp, DNS_PORT) ?: continue
+                    tcpSocket.soTimeout = 1500
+                    val framedQuery = ByteArray(2 + dnsPayload.size)
+                    framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
+                    framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
+                    System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
+                    tcpSocket.getOutputStream().write(framedQuery)
+                    tcpSocket.getOutputStream().flush()
 
-                val respBuf = ByteArray(4096)
-                val inDp = DatagramPacket(respBuf, respBuf.size)
-                socket.receive(inDp)
-
-                val receivedLen = inDp.length
-                if (receivedLen in 12..maxUdpPayload) {
-                    val responsePayload = respBuf.copyOf(receivedLen)
-                    val ipPacket = buildIpv4UdpPacket(
-                        srcIp = dstIp,
-                        dstIp = srcIp,
-                        srcPort = dstPort,
-                        dstPort = srcPort,
-                        payload = responsePayload
-                    )
-                    writePacketToTun(ipPacket, output)
-                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
-                    onDiagnostics {
-                        it.copy(
-                            dnsOkCount = it.dnsOkCount + 1,
-                            lastDnsDetail = "UDP $dnsIp (${ms}ms)"
-                        )
-                    }
-                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
-                        onLog("DNS", "DNS resuelto vía UDP protegido ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
-                    }
-                    return
-                } else if (receivedLen > maxUdpPayload && dnsPayload.size >= 12) {
-                    // Signal TC=1 so client retries DNS over TCP without truncation
-                    val tcResp = respBuf.copyOf(512.coerceAtMost(maxUdpPayload))
-                    tcResp[2] = (tcResp[2].toInt() or 0x02).toByte()
-                    val ipPacket = buildIpv4UdpPacket(
-                        srcIp = dstIp,
-                        dstIp = srcIp,
-                        srcPort = dstPort,
-                        dstPort = srcPort,
-                        payload = tcResp
-                    )
-                    writePacketToTun(ipPacket, output)
-                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
-                    onDiagnostics {
-                        it.copy(
-                            dnsOkCount = it.dnsOkCount + 1,
-                            lastDnsDetail = "UDP-TC $dnsIp (${ms}ms)"
-                        )
-                    }
-                    return
-                }
-            } catch (e: Exception) {
-                lastDnsErr = "UDP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
-            }
-        }
-
-        // Re-check if SSH finished connecting while direct UDP timed out
-        val lateSsh = activeSshClient?.takeIf { it.isConnected() }
-        if (lateSsh != null && resolveDnsViaSsh(lateSsh)) {
-            return
-        }
-
-        // Fallback: DNS-over-TCP (direct or via VPS proxy when active) when carrier blocks UDP port 53
-        for (dnsIp in candidates) {
-            var tcpSocket: Socket? = null
-            try {
-                tcpSocket = if (vpsSupportsConnect) {
-                    openProxyConnectSocket(dnsIp, DNS_PORT)
-                } else null
-                if (tcpSocket == null) {
-                    tcpSocket = Socket()
-                    if (!protectSocket(tcpSocket)) return
-                    tcpSocket.tcpNoDelay = true
-                    tcpSocket.connect(InetSocketAddress(dnsIp, DNS_PORT), 1200)
-                }
-                tcpSocket.soTimeout = 1200
-
-                val framedQuery = ByteArray(2 + dnsPayload.size)
-                framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
-                framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
-                System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
-                tcpSocket.getOutputStream().write(framedQuery)
-                tcpSocket.getOutputStream().flush()
-
-                val inStream = tcpSocket.getInputStream()
-                val lenHi = inStream.read()
-                val lenLo = inStream.read()
-                if (lenHi < 0 || lenLo < 0) continue
-                val respLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
-                if (respLen !in 12..4096) continue
-
-                val responsePayload = ByteArray(respLen)
-                var readTotal = 0
-                while (readTotal < respLen) {
-                    val r = inStream.read(responsePayload, readTotal, respLen - readTotal)
-                    if (r <= 0) break
-                    readTotal += r
-                }
-                if (readTotal == respLen) {
-                    val finalPayload = if (respLen <= maxUdpPayload) {
-                        responsePayload
-                    } else {
-                        responsePayload.copyOf(512.coerceAtMost(maxUdpPayload)).also { tcResp ->
-                            tcResp[2] = (tcResp[2].toInt() or 0x02).toByte()
+                    val inStream = tcpSocket.getInputStream()
+                    val lenHi = inStream.read()
+                    val lenLo = inStream.read()
+                    if (lenHi >= 0 && lenLo >= 0) {
+                        val respLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
+                        if (respLen in 12..4096) {
+                            val responsePayload = ByteArray(respLen)
+                            var readTotal = 0
+                            while (readTotal < respLen) {
+                                val r = inStream.read(responsePayload, readTotal, respLen - readTotal)
+                                if (r <= 0) break
+                                readTotal += r
+                            }
+                            if (readTotal == respLen) {
+                                emitDnsResponse(responsePayload, "Proxy-TCP $dnsIp")
+                                return
+                            }
                         }
                     }
-                    val ipPacket = buildIpv4UdpPacket(
-                        srcIp = dstIp,
-                        dstIp = srcIp,
-                        srcPort = dstPort,
-                        dstPort = srcPort,
-                        payload = finalPayload
-                    )
-                    writePacketToTun(ipPacket, output)
-                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
-                    onDiagnostics {
-                        it.copy(
-                            dnsOkCount = it.dnsOkCount + 1,
-                            lastDnsDetail = "TCP $dnsIp (${ms}ms)"
-                        )
-                    }
-                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
-                        onLog("DNS", "DNS resuelto vía TCP ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
-                    }
-                    return
+                } catch (e: Exception) {
+                    lastDnsErr = "Proxy-TCP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                } finally {
+                    try { tcpSocket?.close() } catch (_: Exception) {}
                 }
-            } catch (e: Exception) {
-                lastDnsErr = "TCP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
-            } finally {
-                try { tcpSocket?.close() } catch (_: Exception) {}
+            }
+
+            // DoH over port 443 via proxy (works even when proxy blocks port 53)
+            val dohPayload = resolveDnsViaProxyDoH(dnsPayload)
+            if (dohPayload != null) {
+                emitDnsResponse(dohPayload, "Proxy-DoH 1.1.1.1:443")
+                return
             }
         }
 
-        val reason = lastDnsErr ?: "Sin respuesta en ${candidates.joinToString()}"
+        // 3. Direct protected UDP/TCP fallback ONLY when allowDirectFallback is enabled
+        if (allowDirectFallback) {
+            for (dnsIp in candidates) {
+                var socket: DatagramSocket? = null
+                try {
+                    socket = DatagramSocket()
+                    if (!bindAndProtectUdpSocket(socket)) {
+                        onLog("DNS", "No se pudo proteger socket UDP DNS", LogLevel.WARNING)
+                        return
+                    }
+                    socket.soTimeout = 750
+                    val targetAddr = InetAddress.getByName(dnsIp)
+                    socket.send(DatagramPacket(dnsPayload, dnsPayload.size, targetAddr, DNS_PORT))
+
+                    val respBuf = ByteArray(4096)
+                    val inDp = DatagramPacket(respBuf, respBuf.size)
+                    socket.receive(inDp)
+
+                    val receivedLen = inDp.length
+                    if (receivedLen in 12..maxUdpPayload) {
+                        emitDnsResponse(respBuf.copyOf(receivedLen), "UDP $dnsIp")
+                        return
+                    } else if (receivedLen > maxUdpPayload && dnsPayload.size >= 12) {
+                        val tcResp = respBuf.copyOf(512.coerceAtMost(maxUdpPayload))
+                        tcResp[2] = (tcResp[2].toInt() or 0x02).toByte()
+                        emitDnsResponse(tcResp, "UDP-TC $dnsIp")
+                        return
+                    }
+                } catch (e: Exception) {
+                    lastDnsErr = "UDP $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                } finally {
+                    try { socket?.close() } catch (_: Exception) {}
+                }
+            }
+        }
+
+        val reason = lastDnsErr ?: "Sin respuesta DNS por túnel en ${candidates.joinToString()}"
         onDiagnostics {
             it.copy(
                 dnsFailCount = it.dnsFailCount + 1,
@@ -1408,8 +1421,83 @@ class TunPacketRelay internal constructor(
         val now = System.currentTimeMillis()
         if (now - lastDnsFailLogAt.get() > 3_000L) {
             lastDnsFailLogAt.set(now)
-            onLog("DNS", "Fallo DNS en todos los servidores ($reason)", LogLevel.ERROR)
+            onLog("DNS", "Fallo DNS ($reason)", LogLevel.ERROR)
         }
+    }
+
+    private fun resolveDnsViaProxyDoH(dnsPayload: ByteArray): ByteArray? {
+        val rawProxy = openProxyConnectSocket("1.1.1.1", 443) ?: return null
+        var sslSocket: javax.net.ssl.SSLSocket? = null
+        return try {
+            val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            sslSocket = (factory.createSocket(rawProxy, "1.1.1.1", 443, true) as javax.net.ssl.SSLSocket).apply {
+                soTimeout = 2500
+                startHandshake()
+            }
+            val reqHeader = buildString {
+                append("POST /dns-query HTTP/1.1\r\n")
+                append("Host: 1.1.1.1\r\n")
+                append("Content-Type: application/dns-message\r\n")
+                append("Accept: application/dns-message\r\n")
+                append("Content-Length: ${dnsPayload.size}\r\n")
+                append("Connection: close\r\n\r\n")
+            }
+            val out = sslSocket.outputStream
+            out.write(reqHeader.toByteArray(Charsets.US_ASCII))
+            out.write(dnsPayload)
+            out.flush()
+
+            val inStream = sslSocket.inputStream
+            val headerText = readHttpHeadersExact(inStream) ?: return null
+            val statusCode = parseHttpStatusCode(headerText.lineSequence().firstOrNull())
+            if (statusCode !in 200..299) return null
+
+            val contentLenLine = headerText.lineSequence()
+                .firstOrNull { it.startsWith("Content-Length:", ignoreCase = true) }
+            val expectedLen = contentLenLine?.substringAfter(':')?.trim()?.toIntOrNull()
+            if (expectedLen != null && expectedLen in 12..4096) {
+                val body = ByteArray(expectedLen)
+                var total = 0
+                while (total < expectedLen) {
+                    val r = inStream.read(body, total, expectedLen - total)
+                    if (r <= 0) break
+                    total += r
+                }
+                if (total == expectedLen) body else null
+            } else {
+                val body = inStream.readBytes()
+                body.takeIf { it.size in 12..4096 }
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            try { sslSocket?.close() } catch (_: Exception) {}
+            try { rawProxy.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun parseHttpStatusCode(statusLine: String?): Int {
+        if (statusLine.isNullOrBlank()) return -1
+        val parts = statusLine.trim().split(Regex("\\s+"))
+        return if (parts.size >= 2) parts[1].toIntOrNull() ?: -1 else -1
+    }
+
+    private fun encodeBasicAuth(raw: String): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        val input = raw.toByteArray(Charsets.UTF_8)
+        val out = StringBuilder(((input.size + 2) / 3) * 4)
+        var i = 0
+        while (i < input.size) {
+            val b0 = input[i].toInt() and 0xFF
+            val b1 = if (i + 1 < input.size) input[i + 1].toInt() and 0xFF else -1
+            val b2 = if (i + 2 < input.size) input[i + 2].toInt() and 0xFF else -1
+            out.append(alphabet[b0 ushr 2])
+            out.append(alphabet[((b0 and 0x03) shl 4) or (if (b1 >= 0) b1 ushr 4 else 0)])
+            out.append(if (b1 >= 0) alphabet[((b1 and 0x0F) shl 2) or (if (b2 >= 0) b2 ushr 6 else 0)] else '=')
+            out.append(if (b2 >= 0) alphabet[b2 and 0x3F] else '=')
+            i += 3
+        }
+        return out.toString()
     }
 
     companion object {

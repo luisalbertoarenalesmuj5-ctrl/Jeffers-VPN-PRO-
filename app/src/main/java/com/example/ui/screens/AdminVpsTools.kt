@@ -23,12 +23,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Http
+import androidx.compose.material.icons.rounded.NetworkCheck
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Speed
+import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.Button
@@ -48,6 +53,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -55,7 +61,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -67,6 +75,7 @@ import com.example.data.local.VpnProfileEntity
 import com.example.data.model.CarrierType
 import com.example.data.model.CountryRegion
 import com.example.data.model.PlanTier
+import com.example.data.model.ServerStatus
 import com.example.data.model.TunnelProtocol
 import com.example.data.repository.VpnRepository
 import com.example.ui.VpnDashboardUiState
@@ -104,8 +113,13 @@ fun AdminServersSection(
     ) -> Unit,
     onSelectProfile: (VpnProfileEntity) -> Unit,
     onDeleteProfile: (VpnProfileEntity) -> Unit,
-    onAnalyzeServer: (VpnProfileEntity) -> Unit
+    onAnalyzeServer: (VpnProfileEntity) -> Unit,
+    onTestProfile: (VpnProfileEntity) -> Unit = {},
+    onVerifyAllServers: () -> Unit = {},
+    onSwitchProfileProtocol: (VpnProfileEntity, TunnelProtocol) -> Unit = { _, _ -> },
+    onEnableHttpConnectAll: () -> Unit = {}
 ) {
+    val clipboard = LocalClipboardManager.current
     val primaryColor = MaterialTheme.colorScheme.primary
     val accentColor = MaterialTheme.colorScheme.secondary
     val surfaceColor = MaterialTheme.colorScheme.surface.copy(alpha = uiState.settings.cardAlpha)
@@ -460,24 +474,74 @@ fun AdminServersSection(
             }
         }
 
-        Text(
-            text = "SERVIDORES EN EL PANEL (${uiState.profiles.size})",
-            style = MaterialTheme.typography.labelSmall,
-            color = primaryColor
+        HttpConnectProxyDeployCard(
+            uiState = uiState,
+            primaryColor = primaryColor,
+            accentColor = accentColor,
+            surfaceColor = surfaceColor,
+            onEnableHttpConnectAll = onEnableHttpConnectAll,
+            onCopyCommand = { cmd -> clipboard.setText(AnnotatedString(cmd)) }
         )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "SERVIDORES EN EL PANEL (${uiState.profiles.size})",
+                style = MaterialTheme.typography.labelSmall,
+                color = primaryColor
+            )
+            OutlinedButton(
+                onClick = onVerifyAllServers,
+                enabled = !uiState.isVerifyingAllServers,
+                border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.55f)),
+                modifier = Modifier
+                    .height(48.dp)
+                    .testTag("admin_verify_all_servers_button")
+            ) {
+                if (uiState.isVerifyingAllServers) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(15.dp),
+                        strokeWidth = 2.dp,
+                        color = primaryColor
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Rounded.Refresh,
+                        contentDescription = "Verificar todos los servidores",
+                        tint = primaryColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (uiState.isVerifyingAllServers) "Verificando…" else "Verificar Todos",
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
 
         uiState.profiles.forEach { profile ->
             val profileTier = PlanTier.fromName(profile.tier)
             val tierColor = Color(profileTier.colorHex)
             val region = CountryRegion.fromName(profile.country)
             val isSelected = profile.id == uiState.selectedProfile?.id
+            val (srvStatus, srvVerification) = resolveEffectiveServerStatus(profile, uiState)
+            val isCheckingThis = srvVerification?.isChecking == true || uiState.testingProfileId == profile.id
 
             Surface(
                 shape = RoundedCornerShape(16.dp),
                 color = surfaceColor,
                 border = BorderStroke(
                     width = if (isSelected) 1.5.dp else 1.dp,
-                    color = if (isSelected) accentColor else OutlineSubtle
+                    color = when {
+                        srvStatus == ServerStatus.CONNECTED -> accentColor
+                        isSelected -> primaryColor
+                        srvStatus == ServerStatus.ERROR -> MaterialTheme.colorScheme.error.copy(alpha = 0.55f)
+                        else -> OutlineSubtle
+                    }
                 ),
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -496,37 +560,64 @@ fun AdminServersSection(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = if (profile.port == 22 || profile.protocol == TunnelProtocol.SSH_DIRECT.name) {
-                                    "${profile.username}@${profile.host}:${profile.port} • ${profile.protocol}"
-                                } else {
-                                    "${profile.host}:${profile.port} • ${profile.protocol} • ${profile.vpsName}"
-                                },
+                                text = "${profile.username.ifBlank { "root" }}@${profile.host}:${profile.port} • ${profile.protocol} • ${profile.vpsName}",
                                 style = MonoTypography.terminal,
-                                color = TextMuted
+                                color = TextMuted,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = tierColor.copy(alpha = 0.18f)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Column(
+                            horizontalAlignment = Alignment.End,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
-                            Text(
-                                text = profileTier.badgeLabel,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                                color = tierColor,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            ServerStatusBadge(
+                                status = srvStatus,
+                                isChecking = isCheckingThis,
+                                accentColor = accentColor
                             )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = tierColor.copy(alpha = 0.18f)
+                            ) {
+                                Text(
+                                    text = profileTier.badgeLabel,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = tierColor,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
                         }
                     }
 
+                    val statusDetail = when {
+                        isCheckingThis -> "Probando IP, puerto, protocolo y credenciales…"
+                        srvVerification != null -> srvVerification.detail
+                        profile.lastLatencyMs != null -> "Última verificación: ${profile.lastLatencyMs} ms"
+                        else -> "Sin verificar — toca Probar para validar conexión"
+                    }
+                    Text(
+                        text = statusDetail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            srvStatus == ServerStatus.ERROR -> MaterialTheme.colorScheme.error
+                            srvStatus == ServerStatus.CONNECTED || srvVerification?.isReachable == true -> accentColor
+                            else -> TextMuted
+                        },
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OutlinedButton(
                             onClick = { onSelectProfile(profile) },
                             border = BorderStroke(1.dp, if (isSelected) accentColor else OutlineSubtle),
-                            modifier = Modifier.weight(1f).height(42.dp)
+                            modifier = Modifier.weight(1f).height(48.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.CheckCircle,
@@ -535,27 +626,76 @@ fun AdminServersSection(
                                 modifier = Modifier.size(15.dp)
                             )
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text(if (isSelected) "Activo" else "Activar", style = MaterialTheme.typography.labelSmall)
+                            Text(if (isSelected) "Elegido" else "Elegir", style = MaterialTheme.typography.labelSmall)
+                        }
+
+                        OutlinedButton(
+                            onClick = { onTestProfile(profile) },
+                            enabled = !isCheckingThis,
+                            border = BorderStroke(1.dp, accentColor.copy(alpha = 0.55f)),
+                            modifier = Modifier.weight(1f).height(48.dp)
+                        ) {
+                            if (isCheckingThis) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(14.dp),
+                                    strokeWidth = 2.dp,
+                                    color = accentColor
+                                )
+                            } else {
+                                Icon(
+                                    imageVector = Icons.Rounded.NetworkCheck,
+                                    contentDescription = "Probar servidor",
+                                    tint = accentColor,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Probar", style = MaterialTheme.typography.labelSmall, color = accentColor)
                         }
 
                         OutlinedButton(
                             onClick = { onAnalyzeServer(profile) },
                             border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.5f)),
-                            modifier = Modifier.weight(1f).height(42.dp)
+                            modifier = Modifier.weight(1f).height(48.dp)
                         ) {
                             Icon(Icons.Rounded.Analytics, contentDescription = null, tint = primaryColor, modifier = Modifier.size(15.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Analizar", style = MaterialTheme.typography.labelSmall, color = primaryColor)
                         }
 
-                        IconButton(onClick = { loadForEdit(profile) }, modifier = Modifier.size(42.dp)) {
+                        IconButton(onClick = { loadForEdit(profile) }, modifier = Modifier.size(48.dp)) {
                             Icon(Icons.Rounded.Edit, contentDescription = "Editar servidor", tint = primaryColor)
                         }
 
                         if (uiState.profiles.size > 1) {
-                            IconButton(onClick = { onDeleteProfile(profile) }, modifier = Modifier.size(42.dp)) {
+                            IconButton(onClick = { onDeleteProfile(profile) }, modifier = Modifier.size(48.dp)) {
                                 Icon(Icons.Rounded.DeleteOutline, contentDescription = "Eliminar servidor", tint = MaterialTheme.colorScheme.error)
                             }
+                        }
+                    }
+
+                    if (profile.protocol != TunnelProtocol.HTTP_CONNECT.name) {
+                        OutlinedButton(
+                            onClick = { onSwitchProfileProtocol(profile, TunnelProtocol.HTTP_CONNECT) },
+                            enabled = !isCheckingThis,
+                            border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.45f)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp)
+                                .testTag("admin_switch_http_connect_${profile.id}")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Http,
+                                contentDescription = "Cambiar a HTTP CONNECT",
+                                tint = primaryColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Cambiar este servidor a HTTP CONNECT",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = primaryColor
+                            )
                         }
                     }
                 }
@@ -563,6 +703,221 @@ fun AdminServersSection(
         }
     }
 }
+
+@Composable
+private fun HttpConnectProxyDeployCard(
+    uiState: VpnDashboardUiState,
+    primaryColor: Color,
+    accentColor: Color,
+    surfaceColor: Color,
+    onEnableHttpConnectAll: () -> Unit,
+    onCopyCommand: (String) -> Unit
+) {
+    val totalCount = uiState.profiles.size
+    val httpConnectCount = uiState.profiles.count { it.protocol == TunnelProtocol.HTTP_CONNECT.name }
+    var proxyFlavor by remember { mutableIntStateOf(0) } // 0 = SSH-Bridge (:8080/:80), 1 = Squid Full (:8080)
+    var copiedNotice by remember { mutableStateOf<String?>(null) }
+
+    val selectedCommand = remember(proxyFlavor) {
+        if (proxyFlavor == 0) VPS_HTTP_CONNECT_SSH_BRIDGE_CMD else VPS_SQUID_CONNECT_CMD
+    }
+
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = surfaceColor,
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.45f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("http_connect_deploy_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Rounded.Http, contentDescription = null, tint = accentColor)
+                    Column {
+                        Text(
+                            text = "Proxy HTTP CONNECT en App y VPS",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                        Text(
+                            text = "$httpConnectCount de $totalCount servidor(es) en modo HTTP CONNECT",
+                            style = MonoTypography.terminal,
+                            color = accentColor
+                        )
+                    }
+                }
+            }
+
+            Text(
+                text = "Activa HTTP CONNECT en tus perfiles guardados (sin borrar IPs ni contraseñas) e instala el proxy en tus VPS si el puerto 80/8080 aún responde 302.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted
+            )
+
+            Button(
+                onClick = onEnableHttpConnectAll,
+                enabled = totalCount > 0 && !uiState.isVerifyingAllServers,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = accentColor,
+                    contentColor = ObsidianVoid
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp)
+                    .testTag("admin_enable_http_connect_all_button")
+            ) {
+                Icon(Icons.Rounded.Http, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (httpConnectCount == totalCount && totalCount > 0) {
+                        "Re-verificar HTTP CONNECT en los $totalCount VPS"
+                    } else {
+                        "Activar HTTP CONNECT en los $totalCount VPS"
+                    },
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = proxyFlavor == 0,
+                    onClick = {
+                        proxyFlavor = 0
+                        copiedNotice = null
+                    },
+                    label = { Text("HTTP CONNECT→SSH (8080/80)") },
+                    modifier = Modifier.height(44.dp)
+                )
+                FilterChip(
+                    selected = proxyFlavor == 1,
+                    onClick = {
+                        proxyFlavor = 1
+                        copiedNotice = null
+                    },
+                    label = { Text("Squid Completo (:8080)") },
+                    modifier = Modifier.height(44.dp)
+                )
+            }
+
+            Surface(
+                shape = RoundedCornerShape(12.dp),
+                color = Color(0xFF0A1017),
+                border = BorderStroke(1.dp, OutlineSubtle),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = selectedCommand,
+                    style = MonoTypography.terminal.copy(fontSize = 10.5.sp),
+                    color = Color(0xFFD6E4F0),
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(10.dp)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = copiedNotice ?: "Pega el comando como root en SSH de cada VPS",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (copiedNotice != null) accentColor else TextMuted,
+                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                )
+                OutlinedButton(
+                    onClick = {
+                        onCopyCommand(selectedCommand)
+                        copiedNotice = "Comando copiado ✓"
+                    },
+                    border = BorderStroke(1.dp, primaryColor.copy(alpha = 0.6f)),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("copy_vps_proxy_script_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.ContentCopy,
+                        contentDescription = "Copiar script proxy VPS",
+                        tint = primaryColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Copiar comando", style = MaterialTheme.typography.labelMedium, color = primaryColor)
+                }
+            }
+        }
+    }
+}
+
+private val VPS_HTTP_CONNECT_SSH_BRIDGE_CMD = """
+sudo bash -c 'cat >/usr/local/bin/jeffers-proxy.py <<"PY"
+import socket,threading
+def pipe(a,b):
+ try:
+  while True:
+   d=a.recv(8192)
+   if not d:break
+   b.sendall(d)
+ except:pass
+ finally:
+  try:a.close()
+  except:pass
+  try:b.close()
+  except:pass
+def handle(c):
+ try:
+  req=b""
+  while b"\r\n\r\n" not in req and len(req)<8192:
+   ch=c.recv(1024)
+   if not ch:break
+   req+=ch
+  parts=req.split(b"\r\n",1)[0].decode("latin1","ignore").split()
+  if len(parts)>=2 and parts[0].upper()=="CONNECT":
+   hp=parts[1].split(":")
+   port=int(hp[1]) if len(hp)>1 else 22
+   if port==22:
+    u=socket.create_connection(("127.0.0.1",22),10)
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    threading.Thread(target=pipe,args=(c,u),daemon=True).start()
+    pipe(u,c);return
+  c.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+ except:pass
+ try:c.close()
+ except:pass
+def serve(p):
+ s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+ try:s.bind(("0.0.0.0",p));s.listen(128)
+ except:return
+ while True:
+  c,_=s.accept()
+  threading.Thread(target=handle,args=(c,),daemon=True).start()
+t1=threading.Thread(target=serve,args=(8080,))
+t2=threading.Thread(target=serve,args=(80,))
+t1.start();t2.start();t1.join();t2.join()
+PY
+printf "[Unit]\nDescription=Jeffers HTTP CONNECT Proxy\nAfter=network.target\n[Service]\nExecStart=/usr/bin/python3 /usr/local/bin/jeffers-proxy.py\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n" >/etc/systemd/system/jeffers-proxy.service && systemctl daemon-reload && systemctl enable --now jeffers-proxy && (ufw allow 8080/tcp 2>/dev/null; ufw allow 80/tcp 2>/dev/null; true) && systemctl status jeffers-proxy --no-pager'
+""".trimIndent()
+
+private val VPS_SQUID_CONNECT_CMD =
+    "sudo bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y squid && printf \"http_port 8080\\nacl Safe_ports port 22 53 80 443\\nacl CONNECT method CONNECT\\nhttp_access allow CONNECT Safe_ports\\nhttp_access allow all\\n\" >/etc/squid/conf.d/jeffers-connect.conf && systemctl enable --now squid && systemctl restart squid && (ufw allow 8080/tcp 2>/dev/null; true) && systemctl status squid --no-pager'"
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable

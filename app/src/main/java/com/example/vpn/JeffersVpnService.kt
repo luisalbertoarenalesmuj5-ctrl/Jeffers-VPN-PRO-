@@ -49,6 +49,48 @@ class JeffersVpnService : VpnService() {
     @Volatile
     private var userInitiatedStop: Boolean = false
 
+    @Volatile
+    private var selfAppExcluded: Boolean = false
+
+    private var loggedBypassFallbackProtect: Boolean = false
+
+    private fun protectSocketSafely(socket: Socket): Boolean {
+        VpsReachabilityTester.bindSocketIfNeeded(socket)
+        if (protect(socket)) {
+            return true
+        }
+        val tunActive = tunInterface != null
+        if (!tunActive || selfAppExcluded) {
+            if (!loggedBypassFallbackProtect) {
+                loggedBypassFallbackProtect = true
+                VpnStateHolder.appendLog(
+                    "SOCK",
+                    if (!tunActive) {
+                        "Socket pre-TUN enlazado directamente sobre red física"
+                    } else {
+                        "App excluida del TUN (addDisallowedApplication); socket protegido por UID"
+                    },
+                    LogLevel.INFO
+                )
+            }
+            return true
+        }
+        return false
+    }
+
+    private fun protectDatagramSafely(socket: java.net.DatagramSocket): Boolean {
+        try {
+            if (!socket.isBound) {
+                socket.bind(null)
+            }
+        } catch (_: Exception) {
+        }
+        if (protect(socket)) {
+            return true
+        }
+        return tunInterface == null || selfAppExcluded
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == ACTION_DISCONNECT) {
@@ -69,7 +111,7 @@ class JeffersVpnService : VpnService() {
         ServiceCompat.startForeground(
             this,
             NOTIFICATION_ID,
-            buildNotification("Iniciando túnel BHTTP…", isConnected = false),
+            buildNotification("Verificando servidor VPS…", isConnected = false),
             fgsType
         )
 
@@ -138,16 +180,22 @@ class JeffersVpnService : VpnService() {
         }
 
         currentProfile = profile
+        selfAppExcluded = false
+        loggedBypassFallbackProtect = false
         val carrier = CarrierType.fromName(profile.carrier)
         val protocol = TunnelProtocol.fromName(profile.protocol)
+        val cleanHost = profile.host.trim()
+        val sshUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val sshCandidatePasswords = VpsReachabilityTester.resolveCandidatePasswords(profile)
 
         VpnStateHolder.resetDiagnostics()
+        VpnStateHolder.markServerChecking(profile.id)
         VpnStateHolder.updateTelemetry {
             it.copy(
                 status = VpnConnectionStatus.CONNECTING,
                 activeProfileId = profile.id,
                 activeProfileName = profile.vpsName,
-                serverHost = profile.host,
+                serverHost = cleanHost,
                 serverPort = profile.port,
                 carrier = carrier,
                 protocol = protocol,
@@ -157,170 +205,367 @@ class JeffersVpnService : VpnService() {
                 txBytesPerSec = 0L,
                 durationSeconds = 0L,
                 pingMs = null,
-                statusMessage = "Conectando (${engineSettings.performanceMode.title}) a ${profile.vpsName}…"
+                statusMessage = "Verificando ${profile.vpsName} ($cleanHost:${profile.port} • ${protocol.badge})…"
             )
+        }
+
+        fun failAttempt(userFacingError: String, logDetail: String = userFacingError): Boolean {
+            VpnStateHolder.appendLog("VPS", logDetail, LogLevel.ERROR)
+            VpnStateHolder.markServerError(profile.id, userFacingError)
+            VpnStateHolder.setStatus(VpnConnectionStatus.ERROR, userFacingError)
+            if (!engineSettings.autoReconnect) {
+                stopTunnel(
+                    status = VpnConnectionStatus.ERROR,
+                    message = userFacingError
+                )
+            }
+            return false
+        }
+
+        val configValidationErr = VpsReachabilityTester.validateProfileConfig(profile)
+        if (configValidationErr != null) {
+            return failAttempt(configValidationErr)
         }
 
         VpnStateHolder.appendLog(
             "VPS",
-            "Iniciando ${profile.vpsName} • ${carrier.displayName}:${profile.port} • ${protocol.badge} • ${engineSettings.performanceMode.title}",
+            "Iniciando ${profile.vpsName} • $cleanHost:${profile.port} • ${carrier.displayName} • ${protocol.badge} • ${engineSettings.performanceMode.title}",
             LogLevel.INFO
         )
 
-        val isSshMode = protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22
-        val sshUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
-        val cleanProfilePass = profile.password.trim()
-        val isDefaultVpsBhttpToken = profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
-            cleanProfilePass == VpnRepository.DEFAULT_VPS_PASSWORD &&
-            sshUser == VpnRepository.DEFAULT_SSH_USER
-        val sshCandidatePasswords = buildList {
-            if (isDefaultVpsBhttpToken) {
-                add(VpnRepository.DEFAULT_SSH_PASSWORD)
-            }
-            if (cleanProfilePass.isNotBlank()) add(cleanProfilePass)
-            if (profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
-                cleanProfilePass != VpnRepository.DEFAULT_SSH_PASSWORD
-            ) {
-                add(VpnRepository.DEFAULT_SSH_PASSWORD)
-            }
-        }.distinct()
-
-        var pingMs: Int
+        var pingMs = 1
         var initialRxBytes = 0L
         var initialTxBytes = 0L
         var establishedSshClient: SshTunnelClient? = null
+        var verifiedProxyConnect = false
+        var verifiedChannelLabel = protocol.badge
 
-        if (isSshMode) {
-            VpnStateHolder.appendLog(
-                "SSH",
-                "Conectando sesión SSH ($sshUser@${profile.host}:${profile.port})…",
-                LogLevel.INFO
-            )
-            val sshClient = SshTunnelClient(
-                vpnService = this@JeffersVpnService,
-                host = profile.host,
-                port = profile.port,
-                username = sshUser,
-                candidatePasswords = sshCandidatePasswords
-            )
-            val connectResult = sshClient.connect(6000)
-            if (connectResult.isFailure) {
-                sshClient.disconnect()
-                val err = connectResult.exceptionOrNull()
-                val errorDetail = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Error SSH"
+        when {
+            protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22 -> {
                 VpnStateHolder.appendLog(
                     "SSH",
-                    "Error autenticando SSH en ${profile.host}:${profile.port}: $errorDetail",
-                    LogLevel.ERROR
-                )
-                if (!engineSettings.autoReconnect) {
-                    stopTunnel(
-                        status = VpnConnectionStatus.ERROR,
-                        message = "Fallo SSH en ${profile.host}:${profile.port} ($errorDetail)"
-                    )
-                }
-                return false
-            }
-            pingMs = connectResult.getOrDefault(1)
-            establishedSshClient = sshClient
-            activeSshClient = sshClient
-            VpnStateHolder.appendLog(
-                "SSH",
-                "Túnel SSH autenticado ($sshUser@${profile.host}:${profile.port} • ${pingMs} ms)",
-                LogLevel.SUCCESS
-            )
-        } else {
-            val socket = Socket()
-            controlSocket = socket
-            try {
-                protect(socket)
-                socket.tcpNoDelay = true
-                socket.keepAlive = true
-                val startNs = System.nanoTime()
-                socket.connect(InetSocketAddress(profile.host, profile.port), 6000)
-                pingMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-                repository.updateLatency(profile.id, pingMs)
-                VpnStateHolder.appendLog(
-                    "TCP",
-                    "Conexión TCP establecida con ${profile.host}:${profile.port} (${pingMs} ms)",
-                    LogLevel.SUCCESS
-                )
-            } catch (e: Exception) {
-                val errorDetail = e.localizedMessage ?: e.javaClass.simpleName
-                VpnStateHolder.appendLog(
-                    "VPS",
-                    "Sin respuesta de ${profile.host}:${profile.port} — $errorDetail",
-                    LogLevel.ERROR
-                )
-                if (!engineSettings.autoReconnect) {
-                    stopTunnel(
-                        status = VpnConnectionStatus.ERROR,
-                        message = "Sin respuesta de ${profile.host}:${profile.port} ($errorDetail)"
-                    )
-                }
-                return false
-            }
-
-            try {
-                socket.soTimeout = 1800
-                val out = socket.getOutputStream()
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                val compiledPayload = BhttpPayloadBuilder.compile(profile)
-                val payloadBytes = compiledPayload.toByteArray(Charsets.UTF_8)
-                initialTxBytes = payloadBytes.size.toLong()
-                val bhttpStartNs = System.nanoTime()
-                out.write(payloadBytes)
-                out.flush()
-                VpnStateHolder.appendLog(
-                    "BHTTP",
-                    "Handshake BHTTP enviado a ${profile.host}:${profile.port} ($initialTxBytes B) • SNI=${profile.sniHost}",
+                    "Conectando sesión SSH ($sshUser@$cleanHost:${profile.port})…",
                     LogLevel.INFO
                 )
-
-                var bhttpReadErr: String? = null
-                val statusLine = try {
-                    reader.readLine()
-                } catch (e: Exception) {
-                    bhttpReadErr = e.localizedMessage ?: e.javaClass.simpleName
-                    null
-                }
-                val bhttpMs = ((System.nanoTime() - bhttpStartNs) / 1_000_000L).toInt().coerceAtLeast(1)
-                if (statusLine != null) {
-                    initialRxBytes += statusLine.toByteArray(Charsets.UTF_8).size
-                    VpnStateHolder.appendLog(
-                        "BHTTP",
-                        "BHTTP ${profile.host}:${profile.port} respondió '$statusLine' (${bhttpMs}ms)",
-                        LogLevel.SUCCESS
-                    )
-                } else {
-                    val reason = bhttpReadErr ?: "EOF / sin cabecera HTTP inmediata"
-                    VpnStateHolder.appendLog(
-                        "BHTTP",
-                        "BHTTP ${profile.host}:${profile.port} sin respuesta en ${bhttpMs}ms ($reason); manteniendo túnel activo",
-                        LogLevel.WARNING
-                    )
-                }
-            } catch (e: Exception) {
-                VpnStateHolder.appendLog(
-                    "BHTTP",
-                    "Error en intercambio inicial: ${e.localizedMessage ?: e.javaClass.simpleName}",
-                    LogLevel.ERROR
+                val sshClient = SshTunnelClient(
+                    protectSocket = ::protectSocketSafely,
+                    host = cleanHost,
+                    port = profile.port,
+                    username = sshUser,
+                    candidatePasswords = sshCandidatePasswords
                 )
-                if (!engineSettings.autoReconnect) {
-                    stopTunnel(
-                        status = VpnConnectionStatus.ERROR,
-                        message = "Fallo en handshake (${e.localizedMessage ?: "Error de red"})"
+                val connectResult = sshClient.connect(6000)
+                if (connectResult.isFailure) {
+                    sshClient.disconnect()
+                    val err = connectResult.exceptionOrNull()
+                    val errorDetail = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Error SSH"
+                    return failAttempt(
+                        userFacingError = "Fallo SSH en $cleanHost:${profile.port}: $errorDetail",
+                        logDetail = "Error autenticando SSH en $cleanHost:${profile.port}: $errorDetail"
                     )
                 }
-                try { socket.close() } catch (_: Exception) {}
-                return false
+                val fwdResult = sshClient.verifyForwarding(4500)
+                if (fwdResult.isFailure) {
+                    val fwdErr = fwdResult.exceptionOrNull()?.localizedMessage ?: "Sin reenvío TCP"
+                    sshClient.disconnect()
+                    return failAttempt(
+                        userFacingError = "SSH autenticado pero sin salida a Internet: $fwdErr",
+                        logDetail = "SSH conectado en $cleanHost:${profile.port} pero direct-tcpip rechazado: $fwdErr"
+                    )
+                }
+                pingMs = connectResult.getOrNull() ?: fwdResult.getOrDefault(1)
+                establishedSshClient = sshClient
+                activeSshClient = sshClient
+                verifiedChannelLabel = "SSH :${profile.port}"
             }
 
-            // Close the initial handshake socket cleanly; TunPacketRelay manages live protected sockets
-            // without using TCP Urgent OOB probes that trigger 15-second proxy resets.
-            try { socket.close() } catch (_: Exception) {}
-            controlSocket = null
+            protocol == TunnelProtocol.HTTP_CONNECT -> {
+                VpnStateHolder.appendLog(
+                    "PROXY",
+                    "Verificando proxy HTTP CONNECT en $cleanHost:${profile.port}…",
+                    LogLevel.INFO
+                )
+                val proxyCheck = VpsReachabilityTester.probeHttpConnectProxy(
+                    host = cleanHost,
+                    port = profile.port,
+                    username = sshUser,
+                    password = profile.password.trim(),
+                    protectSocket = ::protectSocketSafely,
+                    timeoutMs = 5000,
+                    sniHost = profile.sniHost.trim()
+                )
+                if (proxyCheck.supported) {
+                    pingMs = proxyCheck.latencyMs ?: 1
+                    verifiedProxyConnect = true
+                    verifiedChannelLabel = "HTTP CONNECT :${profile.port}"
+                    VpnStateHolder.appendLog(
+                        "PROXY",
+                        "Proxy HTTP CONNECT verificado ✓ (${proxyCheck.statusLine ?: "200 OK"} • ${pingMs} ms)",
+                        LogLevel.SUCCESS
+                    )
+                } else if (sshCandidatePasswords.isNotEmpty()) {
+                    VpnStateHolder.appendLog(
+                        "PROXY",
+                        "Proxy directo no disponible (${proxyCheck.errorDetail ?: proxyCheck.statusLine ?: "sin 200"}); probando HTTP CONNECT→SSH (127.0.0.1:22)…",
+                        LogLevel.INFO
+                    )
+                    val connectFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                        profile = profile,
+                        protectSocket = ::protectSocketSafely,
+                        timeoutMs = 5500,
+                        onLog = VpnStateHolder::appendLog
+                    )
+                    val sshViaProxy = SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = profile.port,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = connectFactory
+                    )
+                    val conn = sshViaProxy.connect(6000)
+                    val fwd = if (conn.isSuccess) sshViaProxy.verifyForwarding(4500) else Result.failure(
+                        conn.exceptionOrNull() ?: java.io.IOException("Error SSH sobre HTTP CONNECT")
+                    )
+                    if (conn.isSuccess && fwd.isSuccess) {
+                        pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
+                        establishedSshClient = sshViaProxy
+                        activeSshClient = sshViaProxy
+                        verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
+                        VpnStateHolder.appendLog(
+                            "PROXY",
+                            "Túnel HTTP CONNECT→SSH verificado ✓ (${pingMs} ms)",
+                            LogLevel.SUCCESS
+                        )
+                    } else {
+                        sshViaProxy.disconnect()
+                        val sshErr = fwd.exceptionOrNull()?.localizedMessage ?: sshViaProxy.lastErrorMessage
+                        val reason = proxyCheck.errorDetail ?: "Puerto ${profile.port} no actúa como proxy HTTP CONNECT"
+                        return failAttempt(
+                            userFacingError = if (sshErr != null) "$reason • $sshErr" else reason,
+                            logDetail = "HTTP CONNECT y HTTP CONNECT→SSH fallaron en $cleanHost:${profile.port}: $reason | $sshErr"
+                        )
+                    }
+                } else {
+                    val reason = proxyCheck.errorDetail ?: "Puerto ${profile.port} no actúa como proxy HTTP CONNECT"
+                    return failAttempt(
+                        userFacingError = reason,
+                        logDetail = "HTTP CONNECT falló en $cleanHost:${profile.port}: $reason"
+                    )
+                }
+            }
+
+            else -> {
+                // BHTTP or BHTTP_WS: test handshake & upgrade, then HTTP CONNECT proxy, then verified SSH :22
+                var bhttpStatusLine: String? = null
+                var bhttpHeaders: String? = null
+                var bhttpTcpOk = false
+                var bhttpTcpErr: String? = null
+
+                val probeSocket = Socket()
+                controlSocket = probeSocket
+                try {
+                    if (!protectSocketSafely(probeSocket)) {
+                        throw java.io.IOException("No se pudo proteger socket de handshake")
+                    }
+                    probeSocket.tcpNoDelay = true
+                    probeSocket.keepAlive = true
+                    val startNs = System.nanoTime()
+                    probeSocket.connect(InetSocketAddress(cleanHost, profile.port), 5500)
+                    pingMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                    bhttpTcpOk = true
+                    VpnStateHolder.appendLog(
+                        "TCP",
+                        "Conexión TCP establecida con $cleanHost:${profile.port} (${pingMs} ms)",
+                        LogLevel.SUCCESS
+                    )
+
+                    probeSocket.soTimeout = 2500
+                    val compiledPayload = BhttpPayloadBuilder.compile(profile)
+                    val payloadBytes = compiledPayload.toByteArray(Charsets.UTF_8)
+                    initialTxBytes = payloadBytes.size.toLong()
+                    probeSocket.getOutputStream().write(payloadBytes)
+                    probeSocket.getOutputStream().flush()
+                    VpnStateHolder.appendLog(
+                        "BHTTP",
+                        "Handshake ${protocol.badge} enviado a $cleanHost:${profile.port} ($initialTxBytes B) • SNI=${profile.sniHost}",
+                        LogLevel.INFO
+                    )
+
+                    bhttpHeaders = VpsReachabilityTester.readHttpHeadersExact(probeSocket.getInputStream())
+                    bhttpStatusLine = bhttpHeaders?.lineSequence()?.firstOrNull()?.trim()
+                    if (bhttpStatusLine != null) {
+                        initialRxBytes += bhttpHeaders!!.toByteArray(Charsets.UTF_8).size
+                        val code = VpsReachabilityTester.parseHttpStatusCode(bhttpStatusLine)
+                        VpnStateHolder.appendLog(
+                            "BHTTP",
+                            "Respuesta servidor: $bhttpStatusLine",
+                            if (code == 101 || code in 200..299) LogLevel.SUCCESS else LogLevel.WARNING
+                        )
+                    } else {
+                        VpnStateHolder.appendLog(
+                            "BHTTP",
+                            "Puerto ${profile.port} sin cabecera HTTP inmediata (EOF/timeout)",
+                            LogLevel.WARNING
+                        )
+                    }
+                } catch (e: Exception) {
+                    bhttpTcpErr = e.localizedMessage ?: e.javaClass.simpleName
+                    VpnStateHolder.appendLog(
+                        "TCP",
+                        "Sin conexión TCP a $cleanHost:${profile.port}: $bhttpTcpErr",
+                        LogLevel.WARNING
+                    )
+                } finally {
+                    try { probeSocket.close() } catch (_: Exception) {}
+                    controlSocket = null
+                }
+
+                // Step A: If server accepted 101 Switching Protocols or non-HTML 200, try SSH over upgraded stream
+                val statusCode = VpsReachabilityTester.parseHttpStatusCode(bhttpStatusLine)
+                val headersLower = bhttpHeaders.orEmpty().lowercase()
+                val supportsUpgrade = statusCode == 101 ||
+                    (statusCode in 200..299 && !headersLower.contains("content-type: text/html"))
+
+                if (bhttpTcpOk && supportsUpgrade && sshCandidatePasswords.isNotEmpty()) {
+                    val upgradeFactory = VpsReachabilityTester.createBhttpUpgradeSocketFactory(
+                        profile = profile,
+                        protectSocket = ::protectSocketSafely,
+                        timeoutMs = 5500,
+                        onLog = VpnStateHolder::appendLog
+                    )
+                    val upgradeSsh = SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = profile.port,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = upgradeFactory
+                    )
+                    val conn = upgradeSsh.connect(5500)
+                    if (conn.isSuccess && upgradeSsh.verifyForwarding(4000).isSuccess) {
+                        establishedSshClient = upgradeSsh
+                        activeSshClient = upgradeSsh
+                        verifiedChannelLabel = "${protocol.badge}→SSH :${profile.port}"
+                    } else {
+                        upgradeSsh.disconnect()
+                    }
+                }
+
+                // Step B: Check if port accepts standard HTTP CONNECT + internet egress OR SSH-over-HTTP-CONNECT
+                if (establishedSshClient == null && bhttpTcpOk) {
+                    val proxyCheck = VpsReachabilityTester.probeHttpConnectProxy(
+                        host = cleanHost,
+                        port = profile.port,
+                        username = sshUser,
+                        password = profile.password.trim(),
+                        protectSocket = ::protectSocketSafely,
+                        timeoutMs = 4500,
+                        sniHost = profile.sniHost.trim()
+                    )
+                    if (proxyCheck.supported) {
+                        verifiedProxyConnect = true
+                        pingMs = proxyCheck.latencyMs ?: pingMs
+                        verifiedChannelLabel = "HTTP CONNECT :${profile.port}"
+                        VpnStateHolder.appendLog(
+                            "PROXY",
+                            "Proxy HTTP CONNECT verificado en :${profile.port} ✓ (${pingMs} ms)",
+                            LogLevel.SUCCESS
+                        )
+                    } else if (sshCandidatePasswords.isNotEmpty()) {
+                        val connectFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5000,
+                            onLog = VpnStateHolder::appendLog
+                        )
+                        val sshViaProxy = SshTunnelClient(
+                            protectSocket = ::protectSocketSafely,
+                            host = cleanHost,
+                            port = profile.port,
+                            username = sshUser,
+                            candidatePasswords = sshCandidatePasswords,
+                            customSocketFactory = connectFactory
+                        )
+                        val connProxy = sshViaProxy.connect(5000)
+                        if (connProxy.isSuccess && sshViaProxy.verifyForwarding(4000).isSuccess) {
+                            pingMs = connProxy.getOrNull() ?: pingMs
+                            establishedSshClient = sshViaProxy
+                            activeSshClient = sshViaProxy
+                            verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
+                            VpnStateHolder.appendLog(
+                                "PROXY",
+                                "Túnel HTTP CONNECT→SSH en :${profile.port} verificado ✓ (${pingMs} ms)",
+                                LogLevel.SUCCESS
+                            )
+                        } else {
+                            sshViaProxy.disconnect()
+                            VpnStateHolder.appendLog(
+                                "PROXY",
+                                "Puerto ${profile.port} no es proxy HTTP CONNECT (${proxyCheck.errorDetail ?: bhttpStatusLine ?: "sin túnel"})",
+                                LogLevel.WARNING
+                            )
+                        }
+                    } else {
+                        VpnStateHolder.appendLog(
+                            "PROXY",
+                            "Puerto ${profile.port} no es proxy HTTP CONNECT (${proxyCheck.errorDetail ?: bhttpStatusLine ?: "sin túnel"})",
+                            LogLevel.WARNING
+                        )
+                    }
+                }
+
+                // Step C: Try real SSH tunnel on port 22 with full direct-tcpip forwarding verification
+                var sshFallbackErr: String? = null
+                if (establishedSshClient == null && !verifiedProxyConnect) {
+                    VpnStateHolder.appendLog(
+                        "SSH",
+                        "Probando túnel SSH verificado en $cleanHost:22 ($sshUser)…",
+                        LogLevel.INFO
+                    )
+                    val ssh22 = SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = 22,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords
+                    )
+                    val conn22 = ssh22.connect(5500)
+                    if (conn22.isSuccess) {
+                        val fwd22 = ssh22.verifyForwarding(4000)
+                        if (fwd22.isSuccess) {
+                            pingMs = conn22.getOrNull() ?: pingMs
+                            establishedSshClient = ssh22
+                            activeSshClient = ssh22
+                            verifiedChannelLabel = "SSH :22 (respaldo)"
+                        } else {
+                            sshFallbackErr = fwd22.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
+                            ssh22.disconnect()
+                        }
+                    } else {
+                        sshFallbackErr = conn22.exceptionOrNull()?.localizedMessage ?: "Sin respuesta en :22"
+                        ssh22.disconnect()
+                    }
+                }
+
+                // Step D: Strict guarantee — NEVER declare CONNECTED without a real verified tunnel!
+                if (establishedSshClient == null && !verifiedProxyConnect) {
+                    val portReason = when {
+                        !bhttpTcpOk -> "Puerto ${profile.port} inaccesible (${bhttpTcpErr ?: "sin conexión"})"
+                        bhttpStatusLine != null -> "Puerto ${profile.port} respondió '$bhttpStatusLine' (no es túnel proxy/WebSocket)"
+                        else -> "Puerto ${profile.port} no responde como túnel HTTP/WebSocket"
+                    }
+                    val sshReason = sshFallbackErr ?: "Sin canal SSH"
+                    return failAttempt(
+                        userFacingError = "$portReason • SSH :22 falló: $sshReason",
+                        logDetail = "CONEXIÓN RECHAZADA (sin túnel real): $portReason | SSH :22: $sshReason"
+                    )
+                }
+            }
         }
+
+        // Update persisted latency now that end-to-end tunnel passed verification
+        repository.updateLatency(profile.id, pingMs)
 
         val activeDnsPrimary = engineSettings.dnsProvider.primary
         val activeDnsSecondary = engineSettings.dnsProvider.secondary
@@ -343,62 +588,101 @@ class JeffersVpnService : VpnService() {
 
             try {
                 builder.addDisallowedApplication(packageName)
+                selfAppExcluded = true
             } catch (_: Exception) {
+                selfAppExcluded = false
             }
 
             builder.establish()
         } catch (e: Exception) {
-            VpnStateHolder.appendLog("TUN", "Error creando interfaz TUN: ${e.localizedMessage}", LogLevel.ERROR)
-            stopTunnel(VpnConnectionStatus.ERROR, "Error creando interfaz VPN local")
-            return false
+            establishedSshClient?.disconnect()
+            activeSshClient = null
+            return failAttempt(
+                userFacingError = "Error creando interfaz TUN: ${e.localizedMessage}",
+                logDetail = "Error creando interfaz TUN: ${e.localizedMessage}"
+            )
         }
 
         if (tunFd == null) {
-            VpnStateHolder.appendLog("TUN", "El sistema canceló la interfaz TUN", LogLevel.ERROR)
-            stopTunnel(VpnConnectionStatus.ERROR, "Permiso VPN no disponible")
-            return false
+            establishedSshClient?.disconnect()
+            activeSshClient = null
+            return failAttempt(
+                userFacingError = "Permiso VPN no disponible o cancelado por Android",
+                logDetail = "El sistema canceló la interfaz TUN"
+            )
         }
 
         tunInterface = tunFd
         sessionStartedAt = System.currentTimeMillis()
         VpnStateHolder.appendLog(
             "TUN",
-            "TUN 10.8.0.2/32 + fd00:10:8::2/128 MTU $activeMtu activo • DNS $activeDnsPrimary / $activeDnsSecondary",
+            "TUN 10.8.0.2/32 + fd00:10:8::2/128 MTU $activeMtu activo • Canal=$verifiedChannelLabel",
             LogLevel.SUCCESS
         )
 
         updateNotification(
-            "Conectado • ${profile.vpsName} (${carrier.displayName} :${profile.port})",
+            "Conectado • ${profile.vpsName} ($verifiedChannelLabel)",
             isConnected = true
         )
 
+        VpnStateHolder.markConnectedServer(
+            profileId = profile.id,
+            latencyMs = pingMs,
+            channelLabel = verifiedChannelLabel
+        )
         VpnStateHolder.updateTelemetry {
             it.copy(
                 status = VpnConnectionStatus.CONNECTED,
                 pingMs = pingMs,
                 rxBytes = initialRxBytes,
                 txBytes = initialTxBytes,
-                statusMessage = if (isSshMode) {
-                    "Túnel SSH activo • ${engineSettings.performanceMode.title}"
-                } else {
-                    "Túnel BHTTP activo • ${engineSettings.performanceMode.title}"
-                }
+                statusMessage = "Conectado ($verifiedChannelLabel) • ${engineSettings.performanceMode.title}"
             )
         }
 
         val relay = TunPacketRelay(
-            vpnService = this@JeffersVpnService,
-            tunFd = tunFd,
+            protectSocket = ::protectSocketSafely,
+            protectDatagramSocket = ::protectDatagramSafely,
+            tunInputProvider = { java.io.FileInputStream(tunFd.fileDescriptor) },
+            tunOutputProvider = { java.io.FileOutputStream(tunFd.fileDescriptor) },
             dnsPrimaryIp = activeDnsPrimary,
             dnsSecondaryIp = activeDnsSecondary,
-            vpsHost = profile.host,
+            vpsHost = cleanHost,
             vpsPort = profile.port,
             vpsUsername = sshUser,
             vpsPassword = profile.password,
             sshCandidatePasswords = sshCandidatePasswords,
             initialSshClient = establishedSshClient,
             scope = serviceScope,
-            mtu = activeMtu
+            mtu = activeMtu,
+            initialProxyVerified = verifiedProxyConnect,
+            allowDirectFallback = false,
+            proxySniHost = profile.sniHost.trim(),
+            sshClientFactory = { targetPort ->
+                if (protocol == TunnelProtocol.HTTP_CONNECT && targetPort == profile.port) {
+                    SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = targetPort,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5500,
+                            onLog = VpnStateHolder::appendLog
+                        )
+                    )
+                } else {
+                    SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = targetPort,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords
+                    )
+                }
+            }
         )
         activeRelay = relay
 
@@ -486,6 +770,13 @@ class JeffersVpnService : VpnService() {
         activeSshClient = null
         try { tunInterface?.close() } catch (_: Exception) {}
         tunInterface = null
+        selfAppExcluded = false
+
+        if (status == VpnConnectionStatus.ERROR) {
+            VpnStateHolder.markServerError(profile?.id, message ?: "Error de conexión")
+        } else {
+            VpnStateHolder.markServerDisconnected(profile?.id)
+        }
 
         VpnStateHolder.updateTelemetry {
             it.copy(

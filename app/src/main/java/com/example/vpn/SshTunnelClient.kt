@@ -48,6 +48,7 @@ class SshTunnelClient(
     private val port: Int,
     private val username: String,
     private val candidatePasswords: List<String>,
+    private val customSocketFactory: SocketFactory? = null,
     private val onLog: (String, String, LogLevel) -> Unit = { tag, msg, level ->
         VpnStateHolder.appendLog(tag, msg, level)
     }
@@ -58,6 +59,7 @@ class SshTunnelClient(
         port: Int,
         username: String,
         candidatePasswords: List<String>,
+        customSocketFactory: SocketFactory? = null,
         onLog: (String, String, LogLevel) -> Unit = { tag, msg, level ->
             VpnStateHolder.appendLog(tag, msg, level)
         }
@@ -67,6 +69,7 @@ class SshTunnelClient(
         port = port,
         username = username,
         candidatePasswords = candidatePasswords,
+        customSocketFactory = customSocketFactory,
         onLog = onLog
     )
 
@@ -134,10 +137,12 @@ class SshTunnelClient(
                 created.setServerAliveInterval(15_000)
                 created.setServerAliveCountMax(3)
                 created.setTimeout(30_000)
-                created.setSocketFactory(ProtectedSocketFactory(protectSocket, timeoutMs) { rtt ->
-                    lastTcpConnectMs = rtt
-                    onLog("SSH", "TCP $host:$port abierto en ${rtt} ms; negociando KEX/Auth…", LogLevel.INFO)
-                })
+                created.setSocketFactory(
+                    customSocketFactory ?: ProtectedSocketFactory(protectSocket, timeoutMs) { rtt ->
+                        lastTcpConnectMs = rtt
+                        onLog("SSH", "TCP $host:$port abierto en ${rtt} ms; negociando KEX/Auth…", LogLevel.INFO)
+                    }
+                )
                 created.connect(timeoutMs)
 
                 synchronized(sessionLock) {
@@ -176,6 +181,55 @@ class SshTunnelClient(
             it.copy(sshFailCount = it.sshFailCount + 1, lastSshDetail = finalDetail)
         }
         return Result.failure(lastError ?: IOException("Error conectando túnel SSH a $host:$port"))
+    }
+
+    /**
+     * Verifies real end-to-end TCP forwarding (`direct-tcpip`) through the authenticated SSH session
+     * so we never report CONNECTED if `AllowTcpForwarding` is disabled or VPS has no internet egress.
+     */
+    fun verifyForwarding(timeoutMs: Int = 4500): Result<Int> {
+        val activeSession = session
+        if (activeSession == null || !activeSession.isConnected) {
+            return Result.failure(IllegalStateException("Sesión SSH no conectada"))
+        }
+
+        val startNs = System.nanoTime()
+        val httpStream = openDirectTcpIp("connectivitycheck.gstatic.com", 80, timeoutMs)
+        if (httpStream != null) {
+            try {
+                httpStream.outputStream.write(
+                    "GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\nConnection: close\r\n\r\n"
+                        .toByteArray(Charsets.UTF_8)
+                )
+                httpStream.outputStream.flush()
+                val buf = ByteArray(256)
+                val n = httpStream.inputStream.read(buf)
+                if (n > 0) {
+                    val statusLine = String(buf, 0, n, Charsets.UTF_8).lineSequence().firstOrNull().orEmpty()
+                    if (statusLine.startsWith("HTTP/")) {
+                        val ms = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                        onLog("SSH", "Reenvío direct-tcpip verificado ✓ ($statusLine • ${ms}ms)", LogLevel.SUCCESS)
+                        return Result.success(ms)
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                httpStream.close()
+            }
+        }
+
+        // Secondary direct-tcpip check on 1.1.1.1:443 (in case port 80 outbound is firewalled on VPS)
+        val tcpStartNs = System.nanoTime()
+        val tcp443 = openDirectTcpIp("1.1.1.1", 443, timeoutMs)
+        if (tcp443 != null) {
+            tcp443.close()
+            val ms = ((System.nanoTime() - tcpStartNs) / 1_000_000L).toInt().coerceAtLeast(1)
+            onLog("SSH", "Reenvío direct-tcpip 1.1.1.1:443 verificado ✓ (${ms}ms)", LogLevel.SUCCESS)
+            return Result.success(ms)
+        }
+
+        val reason = lastErrorMessage ?: "AllowTcpForwarding deshabilitado o sin salida a Internet en VPS"
+        return Result.failure(IOException("Fallo en reenvío SSH ($reason)"))
     }
 
     fun openDirectTcpIp(dstHost: String, dstPort: Int, timeoutMs: Int = 4500): SshTcpStream? {
@@ -234,6 +288,13 @@ class SshTunnelClient(
     ) : SocketFactory {
         override fun createSocket(host: String, port: Int): Socket {
             val socket = Socket()
+            try {
+                // Force native OS socket file descriptor allocation BEFORE VpnService.protect(socket)
+                if (!socket.isBound) {
+                    socket.bind(InetSocketAddress(0))
+                }
+            } catch (_: Exception) {
+            }
             if (!protectSocket(socket)) {
                 try {
                     socket.close()

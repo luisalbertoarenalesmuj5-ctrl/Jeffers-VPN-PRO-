@@ -504,7 +504,10 @@ private fun JeffersVpnAppContent(
                         onBack = { navController.popBackStack() },
                         onOpenCountry = { country ->
                             navController.navigate("$ROUTE_COUNTRY_SERVERS/${country.name}")
-                        }
+                        },
+                        onSelectProfile = viewModel::selectProfile,
+                        onTestProfile = viewModel::testProfileLatency,
+                        onVerifyAllServers = { viewModel.verifyAllConfiguredServers(silentLog = false) }
                     )
                 }
 
@@ -622,6 +625,10 @@ private fun JeffersVpnAppContent(
                         onSelectProfile = viewModel::selectProfile,
                         onDeleteProfile = viewModel::deleteProfile,
                         onRunVpsAnalysis = viewModel::analyzeVps,
+                        onTestProfile = viewModel::testProfileLatency,
+                        onVerifyAllServers = { viewModel.verifyAllConfiguredServers(silentLog = false) },
+                        onSwitchProfileProtocol = viewModel::switchProfileProtocol,
+                        onEnableHttpConnectAll = viewModel::switchAllProfilesToHttpConnect,
                         onSyncCloudLicenses = viewModel::syncAdminLicensesFromCloud,
                         onClearAdminFeedback = viewModel::clearAdminFeedback,
                         isLinkingGoogle = isLinkingGoogle,

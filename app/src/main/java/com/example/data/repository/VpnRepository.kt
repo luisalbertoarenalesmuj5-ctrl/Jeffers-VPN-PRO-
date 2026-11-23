@@ -76,43 +76,9 @@ class VpnRepository(private val vpnDao: VpnDao) {
                 )
                 vpnDao.insertProfiles(presets)
             } else {
-                val existing = vpnDao.getAllProfilesOnce()
-                var deletedSelected = false
-                existing.filter {
-                    it.isPreset &&
-                        it.host == "192.6.154.212" &&
-                        it.port == 22 &&
-                        (CountryRegion.fromName(it.country) == CountryRegion.GUATEMALA ||
-                            it.password == LEGACY_SSH_PASSWORD)
-                }.forEach { extraSsh ->
-                    if (extraSsh.isSelected) deletedSelected = true
-                    vpnDao.deleteProfileById(extraSsh.id)
-                }
-
-                val refreshed = vpnDao.getAllProfilesOnce()
-                val missing = mutableListOf<VpnProfileEntity>()
-                if (refreshed.none {
-                        CountryRegion.fromName(it.country) == CountryRegion.GUATEMALA &&
-                            it.carrier == CarrierType.TIGO.name &&
-                            it.host == "192.6.154.212" &&
-                            it.port == 8080
-                    }
-                ) {
-                    missing += buildGuatemalaProxyPreset(CarrierType.TIGO, port = 8080)
-                }
-                if (refreshed.none {
-                        CountryRegion.fromName(it.country) == CountryRegion.GUATEMALA &&
-                            it.carrier == CarrierType.CLARO.name &&
-                            it.host == "192.6.154.212" &&
-                            it.port == 80
-                    }
-                ) {
-                    missing += buildGuatemalaProxyPreset(CarrierType.CLARO, port = 80)
-                }
-                if (missing.isNotEmpty()) {
-                    vpnDao.insertProfiles(missing)
-                }
-                if (deletedSelected || vpnDao.getSelectedProfileOnce() == null) {
+                // Preserve all user-configured and existing VPS profiles & credentials untouched;
+                // only ensure at least one profile is marked selected if none is selected.
+                if (vpnDao.getSelectedProfileOnce() == null) {
                     vpnDao.getAllProfilesOnce().firstOrNull()?.let { fallback ->
                         vpnDao.selectProfile(fallback.id)
                     }
@@ -171,6 +137,9 @@ class VpnRepository(private val vpnDao: VpnDao) {
     }
 
     suspend fun updateLatency(profileId: Long, latencyMs: Int?) = vpnDao.updateLatency(profileId, latencyMs)
+
+    suspend fun updateProfileProtocol(profileId: Long, protocol: TunnelProtocol) =
+        vpnDao.updateProtocol(profileId, protocol.name)
 
     suspend fun recordSession(session: ConnectionSessionEntity) = vpnDao.insertSession(session)
 
@@ -366,6 +335,5 @@ class VpnRepository(private val vpnDao: VpnDao) {
         const val DEFAULT_VPS_PASSWORD = "7K1MlZfKz5XiiyT8VYQtTDqeFmuxl5KL"
         const val DEFAULT_SSH_USER = "root"
         const val DEFAULT_SSH_PASSWORD = "0xpvujE8ZPSnd3jOvRYPN4skJGPZWD8x"
-        private const val LEGACY_SSH_PASSWORD = "pEzNl9w9M2BrolMWMKVxVU30IUfLsn4O"
     }
 }

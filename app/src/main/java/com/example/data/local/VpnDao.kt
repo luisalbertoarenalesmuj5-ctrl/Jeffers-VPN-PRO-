@@ -53,6 +53,9 @@ interface VpnDao {
     @Query("UPDATE vpn_profiles SET lastLatencyMs = :latencyMs WHERE id = :id")
     suspend fun updateLatency(id: Long, latencyMs: Int?)
 
+    @Query("UPDATE vpn_profiles SET protocol = :protocol WHERE id = :id")
+    suspend fun updateProtocol(id: Long, protocol: String)
+
     @Query("DELETE FROM vpn_profiles WHERE id = :id")
     suspend fun deleteProfileById(id: Long)
 

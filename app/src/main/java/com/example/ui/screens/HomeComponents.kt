@@ -842,6 +842,9 @@ internal fun OnlineServersCard(
     pingMs: Int?,
     activeTier: PlanTier,
     animationStyle: ServerAnimationStyle,
+    serverStatus: com.example.data.model.ServerStatus = com.example.data.model.ServerStatus.DISCONNECTED,
+    isCheckingServer: Boolean = false,
+    serverStatusDetail: String? = null,
     onClick: () -> Unit
 ) {
     val tierColor = Color(activeTier.colorHex)
@@ -911,20 +914,11 @@ internal fun OnlineServersCard(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
                             )
                         }
-                        Row(
-                            verticalAlignment = Alignment.Bottom,
-                            horizontalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            listOf(5.dp, 8.dp, 11.dp, 14.dp).forEach { barH ->
-                                Box(
-                                    modifier = Modifier
-                                        .width(3.dp)
-                                        .height(barH)
-                                        .clip(RoundedCornerShape(1.dp))
-                                        .background(accentColor.copy(alpha = 0.90f))
-                                )
-                            }
-                        }
+                        ServerStatusBadge(
+                            status = serverStatus,
+                            isChecking = isCheckingServer,
+                            accentColor = accentColor
+                        )
                     }
 
                     Row(
@@ -983,10 +977,24 @@ internal fun OnlineServersCard(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        val subtitleText = when {
+                            isCheckingServer -> "$protocolBadge • Verificando VPS…"
+                            serverStatus == com.example.data.model.ServerStatus.ERROR ->
+                                "$protocolBadge • ${serverStatusDetail ?: "Error de conexión"}"
+                            serverStatus == com.example.data.model.ServerStatus.CONNECTED ->
+                                "$protocolBadge • Túnel verificado${pingMs?.let { " • ${it} ms" }.orEmpty()}"
+                            pingMs != null -> "$protocolBadge • Verificado ${pingMs} ms • Toca para cambiar"
+                            !serverStatusDetail.isNullOrBlank() -> "$protocolBadge • $serverStatusDetail"
+                            else -> "$protocolBadge • Toca para ver y probar servidores"
+                        }
                         Text(
-                            text = "$protocolBadge • ${pingMs?.let { "${it} ms óptimos" } ?: "Toca para cambiar servidor"}",
+                            text = subtitleText,
                             style = MonoTypography.terminal.copy(fontSize = 10.5.sp),
-                            color = ChampagneGold.copy(alpha = 0.90f),
+                            color = if (serverStatus == com.example.data.model.ServerStatus.ERROR) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                ChampagneGold.copy(alpha = 0.90f)
+                            },
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )

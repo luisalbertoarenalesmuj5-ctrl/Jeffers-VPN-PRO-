@@ -314,43 +314,66 @@ object NetworkDiagnosticEngine {
             )
         }
 
+        val externalProbe = VpsReachabilityTester.probeHttpConnectProxy(
+            host = profile.host,
+            port = profile.port,
+            username = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER },
+            password = profile.password.trim(),
+            protectSocket = { true },
+            timeoutMs = 3500,
+            sniHost = profile.sniHost.trim()
+        )
+        if (externalProbe.supported) {
+            return NetworkDiagnosticCheck(
+                id = "proxy_connect",
+                title = "Proxy HTTP CONNECT (:${profile.port})",
+                detail = "Puerto ${profile.port} acepta HTTP CONNECT completo hacia Internet (${externalProbe.statusLine ?: "200 OK"}) en ${externalProbe.latencyMs ?: 1} ms.",
+                status = DiagnosticCheckStatus.PASS,
+                latencyMs = externalProbe.latencyMs
+            )
+        }
+
+        // Also test CONNECT 127.0.0.1:22 (SSH-only HTTP CONNECT proxy pattern used by Squid/Python scripts)
         val socket = Socket()
         return try {
             socket.tcpNoDelay = true
             val startNs = System.nanoTime()
-            socket.connect(InetSocketAddress(profile.host, profile.port), 2500)
+            socket.connect(InetSocketAddress(profile.host.trim(), profile.port), 2500)
             socket.soTimeout = 1800
 
-            val req = buildString {
-                append("CONNECT 1.1.1.1:443 HTTP/1.1\r\n")
-                append("Host: 1.1.1.1:443\r\n")
-                append("X-VPS-Auth: ${profile.password}\r\n")
-                append("Proxy-Connection: Keep-Alive\r\n\r\n")
-            }
+            val req = VpsReachabilityTester.buildHttpConnectRequest(
+                dstHost = "127.0.0.1",
+                dstPort = 22,
+                username = profile.username.trim(),
+                password = profile.password.trim(),
+                sniHost = profile.sniHost.trim(),
+                includeAuthHeaders = false
+            )
             socket.getOutputStream().write(req.toByteArray(Charsets.UTF_8))
             socket.getOutputStream().flush()
 
             val statusLine = BufferedReader(InputStreamReader(socket.getInputStream())).readLine()
             val ms = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+            val code = VpsReachabilityTester.parseHttpStatusCode(statusLine)
             when {
-                statusLine != null && statusLine.contains(" 200 ") -> NetworkDiagnosticCheck(
+                code in 200..299 -> NetworkDiagnosticCheck(
                     id = "proxy_connect",
-                    title = "Proxy HTTP CONNECT (:${profile.port})",
-                    detail = "El puerto ${profile.port} acepta túnel HTTP CONNECT ($statusLine) en ${ms} ms.",
+                    title = "Proxy HTTP CONNECT→SSH (:${profile.port})",
+                    detail = "Puerto ${profile.port} acepta HTTP CONNECT hacia SSH 127.0.0.1:22 ($statusLine) en ${ms} ms.",
                     status = DiagnosticCheckStatus.PASS,
                     latencyMs = ms
                 )
                 statusLine != null -> NetworkDiagnosticCheck(
                     id = "proxy_connect",
                     title = "Proxy HTTP CONNECT (:${profile.port})",
-                    detail = "Puerto ${profile.port} rechazó HTTP CONNECT con '$statusLine' (${ms}ms). Se intentará SSH :22 o salida directa.",
+                    detail = "Puerto ${profile.port} rechazó HTTP CONNECT con '$statusLine' (${ms}ms). Instala o activa el proxy HTTP CONNECT en el VPS.",
                     status = DiagnosticCheckStatus.WARN,
                     latencyMs = ms
                 )
                 else -> NetworkDiagnosticCheck(
                     id = "proxy_connect",
                     title = "Proxy HTTP CONNECT (:${profile.port})",
-                    detail = "Puerto ${profile.port} cerró conexión (EOF) sin aceptar HTTP CONNECT (${ms}ms). No funciona como proxy web; requiere SSH :22.",
+                    detail = "Puerto ${profile.port} cerró conexión (EOF) sin aceptar HTTP CONNECT (${ms}ms). Instala el proxy HTTP CONNECT en tu VPS.",
                     status = DiagnosticCheckStatus.WARN,
                     latencyMs = ms
                 )
@@ -359,7 +382,7 @@ object NetworkDiagnosticEngine {
             NetworkDiagnosticCheck(
                 id = "proxy_connect",
                 title = "Proxy HTTP CONNECT (:${profile.port})",
-                detail = "Error probando CONNECT en ${profile.host}:${profile.port}: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                detail = externalProbe.errorDetail ?: "Error probando CONNECT en ${profile.host}:${profile.port}: ${e.localizedMessage ?: e.javaClass.simpleName}",
                 status = DiagnosticCheckStatus.WARN
             )
         } finally {
