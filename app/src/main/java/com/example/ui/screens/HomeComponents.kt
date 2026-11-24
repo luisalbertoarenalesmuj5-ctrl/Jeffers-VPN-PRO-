@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.MusicOff
 import androidx.compose.material.icons.rounded.NetworkCheck
+import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.SignalCellularAlt
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.Speed
@@ -1239,7 +1241,9 @@ internal fun ConnectionSuccessBottomPill(
     pingMs: Int?,
     primaryColor: Color,
     accentColor: Color,
-    isChristmasTheme: Boolean
+    isChristmasTheme: Boolean,
+    serverName: String? = null,
+    onDisconnectClick: (() -> Unit)? = null
 ) {
     val isConnected = status == VpnConnectionStatus.CONNECTED
     val pillBorder = when {
@@ -1252,39 +1256,96 @@ internal fun ConnectionSuccessBottomPill(
         shape = RoundedCornerShape(22.dp),
         color = Color(0xEB07140F),
         border = BorderStroke(1.2.dp, pillBorder),
-        modifier = Modifier.testTag("home_connection_status_pill")
+        modifier = Modifier
+            .fillMaxWidth()
+            .widthIn(max = 520.dp)
+            .testTag("home_connection_status_pill")
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Image(
-                painter = painterResource(id = R.drawable.jeffers_vpn_icon),
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .size(22.dp)
-                    .clip(RoundedCornerShape(6.dp))
-            )
-            if (isConnected) {
-                Icon(
-                    imageVector = Icons.Rounded.CheckCircle,
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.jeffers_vpn_icon),
                     contentDescription = null,
-                    tint = accentColor,
-                    modifier = Modifier.size(18.dp)
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .size(24.dp)
+                        .clip(RoundedCornerShape(6.dp))
                 )
+                if (isConnected) {
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = null,
+                        tint = accentColor,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+                    Text(
+                        text = if (isConnected) {
+                            val pingTag = pingMs?.let { " • ${it}ms" } ?: ""
+                            "Conectado$pingTag"
+                        } else {
+                            "⚡ Conectando túnel cifrado…"
+                        },
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                        color = if (isConnected) accentColor else PulseAmber,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (!serverName.isNullOrBlank()) {
+                        Text(
+                            text = serverName,
+                            style = MonoTypography.terminal.copy(fontSize = 10.5.sp),
+                            color = FrostIce.copy(alpha = 0.85f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
             }
-            Text(
-                text = if (isConnected) {
-                    val pingTag = pingMs?.let { " • ${it}ms" } ?: ""
-                    "Conexión exitosa$pingTag"
-                } else {
-                    "⚡ Conectando túnel cifrado…"
-                },
-                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
-                color = if (isConnected) accentColor else PulseAmber
-            )
+
+            if (onDisconnectClick != null) {
+                Spacer(modifier = Modifier.width(8.dp))
+                Surface(
+                    onClick = onDisconnectClick,
+                    shape = RoundedCornerShape(14.dp),
+                    color = CranberryRed.copy(alpha = 0.24f),
+                    border = BorderStroke(1.dp, CranberryRed.copy(alpha = 0.78f)),
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("home_disconnect_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PowerSettingsNew,
+                            contentDescription = "Desconectar VPN",
+                            tint = FrostIce,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Text(
+                            text = "Desconectar",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            color = FrostIce,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
+                }
+            }
         }
     }
 }

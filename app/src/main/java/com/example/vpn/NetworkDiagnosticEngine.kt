@@ -61,10 +61,14 @@ object NetworkDiagnosticEngine {
         checks += proxyCheck
         logCheck("DIAG-PROXY", proxyCheck, logEmitter)
 
-        // 5. SSH :22 Auth + Real direct-tcpip HTTP 204
-        val sshCheck = probeSshDirectTcpIp(profile, settings, logEmitter)
+        // 5. SSH :22 (or proxy->SSH) Auth + Real direct-tcpip HTTP 204 + DNS + Server NAT/Firewall Audit
+        val (sshCheck, serverAuditCheck) = probeSshAndAuditServer(profile, settings, logEmitter)
         checks += sshCheck
         logCheck("DIAG-SSH", sshCheck, logEmitter)
+        if (serverAuditCheck != null) {
+            checks += serverAuditCheck
+            logCheck("DIAG-VPS", serverAuditCheck, logEmitter)
+        }
 
         // 6. Real End-to-End HTTP 204 Probe
         val httpCheck = probeHttp204("connectivitycheck.gstatic.com", 80)
@@ -390,129 +394,225 @@ object NetworkDiagnosticEngine {
         }
     }
 
-    private fun probeSshDirectTcpIp(
+    private fun probeSshAndAuditServer(
         profile: VpnProfileEntity?,
         settings: AppSettingsState,
         logEmitter: (String, String, LogLevel) -> Unit
-    ): NetworkDiagnosticCheck {
+    ): Pair<NetworkDiagnosticCheck, NetworkDiagnosticCheck?> {
         if (profile == null || profile.host.isBlank()) {
             return NetworkDiagnosticCheck(
                 id = "ssh_tunnel",
                 title = "Túnel SSH (:22) + Salida Internet",
                 detail = "Sin perfil VPS para probar SSH.",
                 status = DiagnosticCheckStatus.WARN
-            )
+            ) to null
         }
 
+        val cleanHost = profile.host.trim()
+        val user = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val credentials = VpsReachabilityTester.resolveCredentialCandidates(
+            profile = profile,
+            personalUsername = settings.personalTunnelUsername,
+            personalPassword = settings.personalTunnelPassword
+        )
+        val passwords = credentials.map { it.password }.distinct()
+
         val bannerSocket = Socket()
-        val bannerText: String?
-        val bannerMs: Int
+        var bannerText: String? = null
+        var bannerMs = 1
+        var useHttpConnectBridge = false
         try {
             val startNs = System.nanoTime()
-            bannerSocket.connect(InetSocketAddress(profile.host, 22), 2500)
+            bannerSocket.connect(InetSocketAddress(cleanHost, 22), 2500)
             bannerSocket.soTimeout = 1800
             bannerText = BufferedReader(InputStreamReader(bannerSocket.getInputStream())).readLine()
             bannerMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
         } catch (e: Exception) {
             try { bannerSocket.close() } catch (_: Exception) {}
-            return NetworkDiagnosticCheck(
-                id = "ssh_tunnel",
-                title = "Túnel SSH (${profile.host}:22)",
-                detail = "Puerto 22 inaccesible: ${e.localizedMessage ?: e.javaClass.simpleName}",
-                status = DiagnosticCheckStatus.FAIL
-            )
+            if (profile.port == 22) {
+                return NetworkDiagnosticCheck(
+                    id = "ssh_tunnel",
+                    title = "Túnel SSH ($cleanHost:22)",
+                    detail = "Puerto 22 inaccesible: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                    status = DiagnosticCheckStatus.FAIL
+                ) to null
+            }
+            useHttpConnectBridge = true
         } finally {
             try { bannerSocket.close() } catch (_: Exception) {}
         }
 
-        val effectiveUser = settings.personalTunnelUsername.trim().ifBlank {
-            profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val probeSsh = if (useHttpConnectBridge) {
+            SshTunnelClient(
+                protectSocket = { true },
+                host = cleanHost,
+                port = profile.port,
+                username = user,
+                candidatePasswords = passwords,
+                customSocketFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                    profile = profile,
+                    protectSocket = { true },
+                    timeoutMs = 3500,
+                    onLog = logEmitter
+                ),
+                onLog = logEmitter,
+                candidateCredentials = credentials
+            )
+        } else {
+            SshTunnelClient(
+                protectSocket = { true },
+                host = cleanHost,
+                port = 22,
+                username = user,
+                candidatePasswords = passwords,
+                onLog = logEmitter,
+                candidateCredentials = credentials
+            )
         }
-        val personalPass = settings.personalTunnelPassword.trim()
-        val cleanProfilePass = profile.password.trim()
-        val candidatePasswords = buildList {
-            if (personalPass.isNotBlank()) add(personalPass)
-            if (profile.host.trim() == VpnRepository.DEFAULT_VPS_HOST &&
-                effectiveUser == VpnRepository.DEFAULT_SSH_USER
-            ) {
-                add(VpnRepository.DEFAULT_SSH_PASSWORD)
-            }
-            if (cleanProfilePass.isNotBlank()) add(cleanProfilePass)
-        }.distinct()
-
-        val probeSsh = SshTunnelClient(
-            protectSocket = { true },
-            host = profile.host,
-            port = 22,
-            username = effectiveUser,
-            candidatePasswords = candidatePasswords,
-            onLog = logEmitter
-        )
 
         return try {
             val connectResult = probeSsh.connect(4500)
             if (connectResult.isFailure) {
                 val err = connectResult.exceptionOrNull()?.localizedMessage ?: "Error autenticación SSH"
+                val portDesc = if (useHttpConnectBridge) "${profile.port} (CONNECT→22)" else "22"
                 return NetworkDiagnosticCheck(
                     id = "ssh_tunnel",
-                    title = "Túnel SSH (${profile.host}:22)",
-                    detail = "Banner '${bannerText ?: "SSH"}' (${bannerMs}ms), pero falló login '$effectiveUser': $err",
+                    title = "Túnel SSH ($cleanHost:$portDesc)",
+                    detail = "Banner '${bannerText ?: "SSH"}' (${bannerMs}ms), pero falló login '${credentials.firstOrNull()?.username ?: user}': $err",
                     status = DiagnosticCheckStatus.FAIL,
                     latencyMs = bannerMs
-                )
+                ) to null
             }
 
             val sshMs = connectResult.getOrDefault(bannerMs)
-            val startChannelNs = System.nanoTime()
-            val channel = probeSsh.openDirectTcpIp("connectivitycheck.gstatic.com", 80, 3500)
-            if (channel == null) {
-                val detail = probeSsh.lastErrorMessage ?: "canal direct-tcpip rechazado por el servidor SSH"
-                return NetworkDiagnosticCheck(
+            val fwdCheck = probeSsh.verifyForwarding(4000)
+
+            // Also verify real DNS resolution through SSH (TCP :53 or DoH :443)
+            val dnsQuery = buildDnsAQueryPacket("google.com")
+            var dnsOverSshOk = false
+            val dohCh = probeSsh.openDirectTcpIp("1.1.1.1", 443, 3000)
+            if (dohCh != null) {
+                try {
+                    val dohResp = DnsSslEngineHelper.executeDoHOverStreams(
+                        input = dohCh.inputStream,
+                        output = dohCh.outputStream,
+                        sniHost = "1.1.1.1",
+                        dnsQuery = dnsQuery,
+                        timeoutMs = 3000,
+                        onTimeoutClose = { dohCh.close() }
+                    )
+                    dnsOverSshOk = dohResp != null && dohResp.size >= 12
+                } finally {
+                    dohCh.close()
+                }
+            }
+
+            val sshCheck = if (fwdCheck.isSuccess) {
+                val fwdMs = fwdCheck.getOrDefault(sshMs)
+                NetworkDiagnosticCheck(
                     id = "ssh_tunnel",
-                    title = "Túnel SSH (${profile.host}:22)",
-                    detail = "SSH autenticado ($effectiveUser), pero el VPS bloqueó AllowTcpForwarding / direct-tcpip ($detail).",
+                    title = "Túnel SSH ($cleanHost:${if (useHttpConnectBridge) "${profile.port}→22" else "22"})",
+                    detail = "Auth OK + direct-tcpip Internet ✓ (${fwdMs}ms) • DNS por túnel=${if (dnsOverSshOk) "OK (DoH 1.1.1.1:443)" else "Solo TCP"}",
+                    status = if (dnsOverSshOk) DiagnosticCheckStatus.PASS else DiagnosticCheckStatus.WARN,
+                    latencyMs = sshMs
+                )
+            } else {
+                val reason = fwdCheck.exceptionOrNull()?.localizedMessage ?: "AllowTcpForwarding deshabilitado o sin salida Internet"
+                NetworkDiagnosticCheck(
+                    id = "ssh_tunnel",
+                    title = "Túnel SSH ($cleanHost:22)",
+                    detail = "SSH autenticado ($user), pero falló reenvío hacia Internet: $reason",
                     status = DiagnosticCheckStatus.FAIL,
                     latencyMs = sshMs
                 )
             }
 
-            try {
-                channel.outputStream.write(
-                    "GET /generate_204 HTTP/1.0\r\nHost: connectivitycheck.gstatic.com\r\n\r\n".toByteArray(Charsets.UTF_8)
+            // Read-only kernel, NAT, firewall, sshd_config & /etc/resolv.conf audit on the VPS
+            val auditCmd = "sh -c 'echo FWD=\$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo NA); " +
+                "echo NAT=\$( (iptables -t nat -S POSTROUTING 2>/dev/null || nft list tables 2>/dev/null || echo NA) | tr \"\\n\" \";\"); " +
+                "echo SSHD=\$(grep -iE \"^(AllowTcpForwarding|PermitOpen)\" /etc/ssh/sshd_config 2>/dev/null | tr \"\\n\" \";\"); " +
+                "echo DNS=\$(grep -E \"^nameserver\" /etc/resolv.conf 2>/dev/null | head -n 3 | tr \"\\n\" \";\"); " +
+                "echo UFW=\$( (ufw status 2>/dev/null | head -n 1) || echo NA); " +
+                "echo PORTS=\$( (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -oE \":(22|80|443|8080)\\b\" | sort -u | tr \"\\n\" \",\")'"
+            val execRes = probeSsh.runExecCommand(auditCmd, 3500)
+            val auditCheck = if (execRes.isSuccess) {
+                parseVpsKernelAuditOutput(execRes.getOrNull().orEmpty(), profile.port)
+            } else {
+                NetworkDiagnosticCheck(
+                    id = "vps_server_audit",
+                    title = "Auditoría Sistema VPS (NAT / Firewall / Forwarding)",
+                    detail = "Shell exec restringida en VPS (${execRes.exceptionOrNull()?.localizedMessage ?: "nologin"}); verificado vía tráfico directo.",
+                    status = DiagnosticCheckStatus.WARN
                 )
-                channel.outputStream.flush()
-                val httpLine = BufferedReader(InputStreamReader(channel.inputStream)).readLine()
-                val totalMs = ((System.nanoTime() - startChannelNs) / 1_000_000L).toInt().coerceAtLeast(1)
-                if (httpLine != null && (httpLine.contains("204") || httpLine.contains("200"))) {
-                    NetworkDiagnosticCheck(
-                        id = "ssh_tunnel",
-                        title = "Túnel SSH (${profile.host}:22)",
-                        detail = "Auth OK + canal direct-tcpip funcional -> '$httpLine' en ${totalMs} ms.",
-                        status = DiagnosticCheckStatus.PASS,
-                        latencyMs = sshMs
-                    )
-                } else {
-                    NetworkDiagnosticCheck(
-                        id = "ssh_tunnel",
-                        title = "Túnel SSH (${profile.host}:22)",
-                        detail = "Canal direct-tcpip abierto, respuesta inesperada: ${httpLine ?: "EOF sin respuesta HTTP"}",
-                        status = DiagnosticCheckStatus.WARN,
-                        latencyMs = totalMs
-                    )
-                }
-            } finally {
-                channel.close()
             }
+
+            sshCheck to auditCheck
         } catch (e: Exception) {
             NetworkDiagnosticCheck(
                 id = "ssh_tunnel",
-                title = "Túnel SSH (${profile.host}:22)",
+                title = "Túnel SSH ($cleanHost:22)",
                 detail = "Excepción probando canal SSH: ${e.localizedMessage ?: e.javaClass.simpleName}",
                 status = DiagnosticCheckStatus.FAIL
-            )
+            ) to null
         } finally {
             probeSsh.disconnect()
         }
+    }
+
+    internal fun parseVpsKernelAuditOutput(raw: String, configuredPort: Int): NetworkDiagnosticCheck {
+        val values = raw.lineSequence()
+            .mapNotNull { line ->
+                val idx = line.indexOf('=')
+                if (idx <= 0) null else line.substring(0, idx).trim() to line.substring(idx + 1).trim()
+            }
+            .toMap()
+
+        val fwd = values["FWD"] ?: "NA"
+        val nat = values["NAT"].orEmpty()
+        val sshd = values["SSHD"].orEmpty()
+        val dns = values["DNS"].orEmpty()
+        val ufw = values["UFW"].orEmpty()
+        val ports = values["PORTS"].orEmpty().trimEnd(',')
+
+        val ipForwardOk = fwd == "1"
+        val natMasqueradeOk = nat.contains("MASQUERADE", ignoreCase = true) ||
+            nat.contains("SNAT", ignoreCase = true) ||
+            nat.contains("ip nat", ignoreCase = true)
+        val sshdBlocked = sshd.contains("AllowTcpForwarding no", ignoreCase = true) ||
+            sshd.contains("PermitOpen none", ignoreCase = true)
+        val hasResolvDns = dns.contains("nameserver")
+        val targetPortOpen = configuredPort == 22 || ports.contains(":$configuredPort")
+
+        val issues = buildList {
+            if (fwd == "0") add("ip_forward=0 (desactivado)")
+            if (!natMasqueradeOk && !nat.contains("NA")) add("sin regla NAT MASQUERADE en POSTROUTING")
+            if (sshdBlocked) add("sshd bloquea AllowTcpForwarding/PermitOpen")
+            if (!hasResolvDns) add("/etc/resolv.conf sin nameserver")
+            if (!targetPortOpen && configuredPort != 22) add("sin servicio escuchando en :$configuredPort")
+        }
+
+        val status = when {
+            sshdBlocked -> DiagnosticCheckStatus.FAIL
+            issues.isNotEmpty() -> DiagnosticCheckStatus.WARN
+            else -> DiagnosticCheckStatus.PASS
+        }
+
+        val summary = buildString {
+            append("ip_forward=${if (ipForwardOk) "1 ✓" else fwd}")
+            append(" • NAT=${if (natMasqueradeOk) "MASQUERADE ✓" else if (nat.isBlank() || nat == "NA") "No legible" else "Sin MASQUERADE"}")
+            append(" • SSHD=${if (sshdBlocked) "Bloqueado" else "Forwarding OK"}")
+            if (dns.isNotBlank()) append(" • DNS=${dns.replace("nameserver ", "").replace(";", " ").trim()}")
+            if (ports.isNotBlank()) append(" • Puertos=$ports")
+            if (ufw.isNotBlank() && ufw != "NA") append(" • UFW=$ufw")
+            if (issues.isNotEmpty()) append(" • Revisar: ${issues.joinToString(", ")}")
+        }
+
+        return NetworkDiagnosticCheck(
+            id = "vps_server_audit",
+            title = "Auditoría VPS (Forwarding / NAT / Firewall)",
+            detail = summary,
+            status = status
+        )
     }
 
     private fun probeHttp204(host: String, port: Int): NetworkDiagnosticCheck {

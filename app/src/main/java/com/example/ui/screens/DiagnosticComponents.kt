@@ -154,7 +154,7 @@ fun LiveConsoleTab(
                 it.level == LogLevel.ERROR || it.level == LogLevel.WARNING
             }
             LogFilterCategory.SSH_BHTTP -> logs.filter {
-                it.tag in setOf("SSH", "SSH-CORE", "BHTTP", "PROXY", "PROBE", "VPS", "DIAG", "DIAG-BHTTP", "DIAG-PROXY", "DIAG-SSH")
+                it.tag in setOf("SSH", "SSH-CORE", "BHTTP", "PROXY", "PROBE", "VPS", "DIAG", "DIAG-BHTTP", "DIAG-PROXY", "DIAG-SSH", "DIAG-VPS")
             }
             LogFilterCategory.DNS_TCP -> logs.filter {
                 it.tag in setOf("DNS", "TCP", "UDP", "TUN", "RELAY", "DIAG-DNS", "DIAG-HTTP", "INTERFAZ")

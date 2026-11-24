@@ -14,6 +14,11 @@ import java.net.Socket
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
+data class SshCredential(
+    val username: String,
+    val password: String
+)
+
 class SshTcpStream(
     private val channel: ChannelDirectTCPIP,
     val inputStream: InputStream,
@@ -51,7 +56,8 @@ class SshTunnelClient(
     private val customSocketFactory: SocketFactory? = null,
     private val onLog: (String, String, LogLevel) -> Unit = { tag, msg, level ->
         VpnStateHolder.appendLog(tag, msg, level)
-    }
+    },
+    private val candidateCredentials: List<SshCredential> = emptyList()
 ) {
     constructor(
         vpnService: VpnService,
@@ -62,7 +68,8 @@ class SshTunnelClient(
         customSocketFactory: SocketFactory? = null,
         onLog: (String, String, LogLevel) -> Unit = { tag, msg, level ->
             VpnStateHolder.appendLog(tag, msg, level)
-        }
+        },
+        candidateCredentials: List<SshCredential> = emptyList()
     ) : this(
         protectSocket = { sock -> vpnService.protect(sock) },
         host = host,
@@ -70,7 +77,8 @@ class SshTunnelClient(
         username = username,
         candidatePasswords = candidatePasswords,
         customSocketFactory = customSocketFactory,
-        onLog = onLog
+        onLog = onLog,
+        candidateCredentials = candidateCredentials
     )
 
     private val sessionLock = Any()
@@ -90,20 +98,34 @@ class SshTunnelClient(
 
     fun isConnected(): Boolean = session?.isConnected == true
 
+    private fun resolveCredentialsToTry(): List<SshCredential> {
+        val defaultUser = username.trim().ifBlank { "root" }
+        val fromExplicit = candidateCredentials.mapNotNull { cred ->
+            val u = cred.username.trim().ifBlank { defaultUser }
+            val p = cred.password.trim()
+            if (p.isNotEmpty()) SshCredential(u, p) else null
+        }
+        val fromPasswords = candidatePasswords.mapNotNull { pwd ->
+            val clean = pwd.trim()
+            if (clean.isNotEmpty()) SshCredential(defaultUser, clean) else null
+        }
+        return (fromExplicit + fromPasswords).distinct()
+    }
+
     fun connect(timeoutMs: Int = 5500): Result<Int> {
-        val passwordsToTry = candidatePasswords.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-        if (passwordsToTry.isEmpty()) {
+        val credentialsToTry = resolveCredentialsToTry()
+        if (credentialsToTry.isEmpty()) {
             val err = IllegalStateException("Sin contraseña SSH configurada")
             lastErrorMessage = err.message
             onLog("SSH", "Error: sin contraseña SSH configurada", LogLevel.ERROR)
             return Result.failure(err)
         }
 
-        val effectiveUser = username.ifBlank { "root" }
-        onLog("SSH", "SSH → $effectiveUser@$host:$port (${passwordsToTry.size} clave(s))", LogLevel.INFO)
+        val usersSummary = credentialsToTry.map { it.username }.distinct().joinToString("/")
+        onLog("SSH", "SSH → $usersSummary@$host:$port (${credentialsToTry.size} credencial(es))", LogLevel.INFO)
 
         var lastError: Exception? = null
-        passwordsToTry.forEachIndexed { index, pwd ->
+        credentialsToTry.forEachIndexed { index, cred ->
             var candidateSession: Session? = null
             try {
                 JSch.setLogger(object : com.jcraft.jsch.Logger {
@@ -126,9 +148,9 @@ class SshTunnelClient(
                     }
                 })
                 val jsch = JSch()
-                val created = jsch.getSession(effectiveUser, host, port)
+                val created = jsch.getSession(cred.username, host, port)
                 candidateSession = created
-                created.setPassword(pwd)
+                created.setPassword(cred.password)
                 created.setConfig("StrictHostKeyChecking", "no")
                 created.setConfig("PreferredAuthentications", "password,keyboard-interactive")
                 created.setConfig("PubkeyAuthentication", "no")
@@ -157,7 +179,7 @@ class SshTunnelClient(
                 lastErrorMessage = null
                 onLog(
                     "SSH",
-                    "SSH autenticado ✓ ($effectiveUser@$host:$port • ${lastTcpConnectMs} ms)",
+                    "SSH autenticado ✓ (${cred.username}@$host:$port • ${lastTcpConnectMs} ms)",
                     LogLevel.SUCCESS
                 )
                 return Result.success(lastTcpConnectMs)
@@ -167,7 +189,7 @@ class SshTunnelClient(
                 lastErrorMessage = detail
                 onLog(
                     "SSH",
-                    "Intento SSH ${index + 1}/${passwordsToTry.size} falló en $host:$port ($detail)",
+                    "Intento SSH ${index + 1}/${credentialsToTry.size} (${cred.username}) falló en $host:$port ($detail)",
                     LogLevel.WARNING
                 )
                 try {
@@ -184,8 +206,9 @@ class SshTunnelClient(
     }
 
     /**
-     * Verifies real end-to-end TCP forwarding (`direct-tcpip`) through the authenticated SSH session
-     * so we never report CONNECTED if `AllowTcpForwarding` is disabled or VPS has no internet egress.
+     * Verifies real end-to-end TCP forwarding (`direct-tcpip`) + real DNS/Internet egress through
+     * the authenticated SSH session so we never report CONNECTED if `AllowTcpForwarding` is disabled
+     * or VPS firewall/DNS blocks internet traffic.
      */
     fun verifyForwarding(timeoutMs: Int = 4500): Result<Int> {
         val activeSession = session
@@ -208,7 +231,7 @@ class SshTunnelClient(
                     val statusLine = String(buf, 0, n, Charsets.UTF_8).lineSequence().firstOrNull().orEmpty()
                     if (statusLine.startsWith("HTTP/")) {
                         val ms = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-                        onLog("SSH", "Reenvío direct-tcpip verificado ✓ ($statusLine • ${ms}ms)", LogLevel.SUCCESS)
+                        onLog("SSH", "Reenvío direct-tcpip + Internet verificados ✓ ($statusLine • ${ms}ms)", LogLevel.SUCCESS)
                         return Result.success(ms)
                     }
                 }
@@ -218,18 +241,86 @@ class SshTunnelClient(
             }
         }
 
-        // Secondary direct-tcpip check on 1.1.1.1:443 (in case port 80 outbound is firewalled on VPS)
-        val tcpStartNs = System.nanoTime()
-        val tcp443 = openDirectTcpIp("1.1.1.1", 443, timeoutMs)
-        if (tcp443 != null) {
-            tcp443.close()
-            val ms = ((System.nanoTime() - tcpStartNs) / 1_000_000L).toInt().coerceAtLeast(1)
-            onLog("SSH", "Reenvío direct-tcpip 1.1.1.1:443 verificado ✓ (${ms}ms)", LogLevel.SUCCESS)
-            return Result.success(ms)
+        // Secondary check: HTTPS + DNS-over-HTTPS (1.1.1.1:443) or TCP DNS :53 via direct-tcpip
+        val dohStartNs = System.nanoTime()
+        val dohStream = openDirectTcpIp("1.1.1.1", 443, timeoutMs)
+        if (dohStream != null) {
+            try {
+                val query = NetworkDiagnosticEngine.buildDnsAQueryPacket("google.com")
+                val dohResp = DnsSslEngineHelper.executeDoHOverStreams(
+                    input = dohStream.inputStream,
+                    output = dohStream.outputStream,
+                    sniHost = "1.1.1.1",
+                    dnsQuery = query,
+                    timeoutMs = timeoutMs
+                )
+                if (dohResp != null && dohResp.size >= 12) {
+                    val ms = ((System.nanoTime() - dohStartNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                    onLog("SSH", "Reenvío direct-tcpip + HTTPS DoH 1.1.1.1:443 verificado ✓ (${ms}ms)", LogLevel.SUCCESS)
+                    return Result.success(ms)
+                }
+            } catch (e: Exception) {
+                lastErrorMessage = "1.1.1.1:443 abierto sin respuesta TLS/DoH (${e.localizedMessage ?: "sin salida"})"
+            } finally {
+                dohStream.close()
+            }
         }
 
-        val reason = lastErrorMessage ?: "AllowTcpForwarding deshabilitado o sin salida a Internet en VPS"
+        val reason = lastErrorMessage ?: "AllowTcpForwarding deshabilitado o sin salida a Internet/DNS en VPS"
         return Result.failure(IOException("Fallo en reenvío SSH ($reason)"))
+    }
+
+    fun runExecCommand(command: String, timeoutMs: Int = 4000): Result<String> {
+        val activeSession = session
+        if (activeSession == null || !activeSession.isConnected) {
+            return Result.failure(IllegalStateException("Sesión SSH no conectada"))
+        }
+        var channel: com.jcraft.jsch.ChannelExec? = null
+        return try {
+            channel = activeSession.openChannel("exec") as com.jcraft.jsch.ChannelExec
+            channel.setCommand(command)
+            val stdout = channel.inputStream
+            val stderr = channel.errStream
+            channel.connect(timeoutMs)
+
+            val deadline = System.currentTimeMillis() + timeoutMs
+            val outBuf = java.io.ByteArrayOutputStream()
+            val tmp = ByteArray(1024)
+            while (System.currentTimeMillis() < deadline) {
+                while (stdout.available() > 0) {
+                    val read = stdout.read(tmp)
+                    if (read <= 0) break
+                    if (outBuf.size() < 16_384) outBuf.write(tmp, 0, read)
+                }
+                while (stderr.available() > 0) {
+                    val read = stderr.read(tmp)
+                    if (read <= 0) break
+                    if (outBuf.size() < 16_384) outBuf.write(tmp, 0, read)
+                }
+                if (channel.isClosed) {
+                    while (stdout.available() > 0) {
+                        val read = stdout.read(tmp)
+                        if (read <= 0) break
+                        if (outBuf.size() < 16_384) outBuf.write(tmp, 0, read)
+                    }
+                    break
+                }
+                Thread.sleep(40)
+            }
+            val text = outBuf.toString(Charsets.UTF_8.name()).trim()
+            if (text.isNotEmpty() || channel.exitStatus == 0) {
+                Result.success(text)
+            } else {
+                Result.failure(IOException("Exec salió con código ${channel.exitStatus}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            try {
+                channel?.disconnect()
+            } catch (_: Exception) {
+            }
+        }
     }
 
     fun openDirectTcpIp(dstHost: String, dstPort: Int, timeoutMs: Int = 4500): SshTcpStream? {

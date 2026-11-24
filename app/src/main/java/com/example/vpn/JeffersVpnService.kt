@@ -52,6 +52,9 @@ class JeffersVpnService : VpnService() {
     @Volatile
     private var selfAppExcluded: Boolean = false
 
+    @Volatile
+    private var lastAttemptErrorMessage: String? = null
+
     private var loggedBypassFallbackProtect: Boolean = false
 
     private fun protectSocketSafely(socket: Socket): Boolean {
@@ -124,12 +127,19 @@ class JeffersVpnService : VpnService() {
 
     private suspend fun runWithAutoReconnect(requestedProfileId: Long) {
         val settingsStore = SettingsStore(applicationContext)
-        val maxAttempts = if (settingsStore.settings.value.autoReconnect) 5 else 1
+        val autoReconnectEnabled = settingsStore.settings.value.autoReconnect
+        val maxAttempts = if (autoReconnectEnabled) 5 else 1
         var attempt = 1
+        var finishedCleanly = false
 
         while (attempt <= maxAttempts && !userInitiatedStop && serviceScope.isActive) {
+            lastAttemptErrorMessage = null
             val result = startTunnelAttempt(requestedProfileId)
-            if (userInitiatedStop || !settingsStore.settings.value.autoReconnect || result) {
+            if (userInitiatedStop || result) {
+                finishedCleanly = true
+                break
+            }
+            if (!settingsStore.settings.value.autoReconnect) {
                 break
             }
             if (attempt < maxAttempts) {
@@ -144,6 +154,13 @@ class JeffersVpnService : VpnService() {
             }
             attempt++
         }
+
+        if (!finishedCleanly && !userInitiatedStop && serviceScope.isActive) {
+            stopTunnel(
+                status = VpnConnectionStatus.ERROR,
+                message = lastAttemptErrorMessage ?: "No se pudo establecer el túnel VPN tras $maxAttempts intento(s)"
+            )
+        }
     }
 
     private suspend fun startTunnelAttempt(requestedProfileId: Long): Boolean {
@@ -157,6 +174,7 @@ class JeffersVpnService : VpnService() {
         }
 
         if (baseProfile == null) {
+            lastAttemptErrorMessage = "No hay perfil VPS seleccionado"
             VpnStateHolder.appendLog("CORE", "No se encontró ningún perfil VPS activo", LogLevel.ERROR)
             stopTunnel(VpnConnectionStatus.ERROR, "No hay perfil VPS seleccionado")
             return false
@@ -165,18 +183,13 @@ class JeffersVpnService : VpnService() {
         val engineSettings = SettingsStore(applicationContext).settings.value
         val personalUser = engineSettings.personalTunnelUsername.trim()
         val personalPass = engineSettings.personalTunnelPassword.trim()
-        val profile = if (personalUser.isNotEmpty()) {
+        val profile = baseProfile
+        if (personalUser.isNotEmpty()) {
             VpnStateHolder.appendLog(
                 "CUENTA",
-                "Usando usuario personal de túnel: $personalUser",
+                "Credenciales VPS (${baseProfile.username.ifBlank { "root" }}) + respaldo personal ($personalUser)",
                 LogLevel.INFO
             )
-            baseProfile.copy(
-                username = personalUser,
-                password = personalPass.ifEmpty { baseProfile.password }
-            )
-        } else {
-            baseProfile
         }
 
         currentProfile = profile
@@ -186,7 +199,12 @@ class JeffersVpnService : VpnService() {
         val protocol = TunnelProtocol.fromName(profile.protocol)
         val cleanHost = profile.host.trim()
         val sshUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
-        val sshCandidatePasswords = VpsReachabilityTester.resolveCandidatePasswords(profile)
+        val sshCandidateCredentials = VpsReachabilityTester.resolveCredentialCandidates(
+            profile = profile,
+            personalUsername = personalUser,
+            personalPassword = personalPass
+        )
+        val sshCandidatePasswords = sshCandidateCredentials.map { it.password }.distinct()
 
         VpnStateHolder.resetDiagnostics()
         VpnStateHolder.markServerChecking(profile.id)
@@ -210,6 +228,7 @@ class JeffersVpnService : VpnService() {
         }
 
         fun failAttempt(userFacingError: String, logDetail: String = userFacingError): Boolean {
+            lastAttemptErrorMessage = userFacingError
             VpnStateHolder.appendLog("VPS", logDetail, LogLevel.ERROR)
             VpnStateHolder.markServerError(profile.id, userFacingError)
             VpnStateHolder.setStatus(VpnConnectionStatus.ERROR, userFacingError)
@@ -222,7 +241,7 @@ class JeffersVpnService : VpnService() {
             return false
         }
 
-        val configValidationErr = VpsReachabilityTester.validateProfileConfig(profile)
+        val configValidationErr = VpsReachabilityTester.validateProfileConfig(profile, personalUser, personalPass)
         if (configValidationErr != null) {
             return failAttempt(configValidationErr)
         }
@@ -239,6 +258,7 @@ class JeffersVpnService : VpnService() {
         var establishedSshClient: SshTunnelClient? = null
         var verifiedProxyConnect = false
         var verifiedChannelLabel = protocol.badge
+        var verifiedSshMode = "DIRECT"
 
         when {
             protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22 -> {
@@ -252,7 +272,8 @@ class JeffersVpnService : VpnService() {
                     host = cleanHost,
                     port = profile.port,
                     username = sshUser,
-                    candidatePasswords = sshCandidatePasswords
+                    candidatePasswords = sshCandidatePasswords,
+                    candidateCredentials = sshCandidateCredentials
                 )
                 val connectResult = sshClient.connect(6000)
                 if (connectResult.isFailure) {
@@ -321,7 +342,8 @@ class JeffersVpnService : VpnService() {
                         port = profile.port,
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
-                        customSocketFactory = connectFactory
+                        customSocketFactory = connectFactory,
+                        candidateCredentials = sshCandidateCredentials
                     )
                     val conn = sshViaProxy.connect(6000)
                     val fwd = if (conn.isSuccess) sshViaProxy.verifyForwarding(4500) else Result.failure(
@@ -331,6 +353,7 @@ class JeffersVpnService : VpnService() {
                         pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
                         establishedSshClient = sshViaProxy
                         activeSshClient = sshViaProxy
+                        verifiedSshMode = "HTTP_CONNECT"
                         verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
                         VpnStateHolder.appendLog(
                             "PROXY",
@@ -440,12 +463,14 @@ class JeffersVpnService : VpnService() {
                         port = profile.port,
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
-                        customSocketFactory = upgradeFactory
+                        customSocketFactory = upgradeFactory,
+                        candidateCredentials = sshCandidateCredentials
                     )
                     val conn = upgradeSsh.connect(5500)
                     if (conn.isSuccess && upgradeSsh.verifyForwarding(4000).isSuccess) {
                         establishedSshClient = upgradeSsh
                         activeSshClient = upgradeSsh
+                        verifiedSshMode = "BHTTP_UPGRADE"
                         verifiedChannelLabel = "${protocol.badge}→SSH :${profile.port}"
                     } else {
                         upgradeSsh.disconnect()
@@ -472,7 +497,7 @@ class JeffersVpnService : VpnService() {
                             "Proxy HTTP CONNECT verificado en :${profile.port} ✓ (${pingMs} ms)",
                             LogLevel.SUCCESS
                         )
-                    } else if (sshCandidatePasswords.isNotEmpty()) {
+                    } else if (sshCandidateCredentials.isNotEmpty()) {
                         val connectFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
                             profile = profile,
                             protectSocket = ::protectSocketSafely,
@@ -485,13 +510,15 @@ class JeffersVpnService : VpnService() {
                             port = profile.port,
                             username = sshUser,
                             candidatePasswords = sshCandidatePasswords,
-                            customSocketFactory = connectFactory
+                            customSocketFactory = connectFactory,
+                            candidateCredentials = sshCandidateCredentials
                         )
                         val connProxy = sshViaProxy.connect(5000)
                         if (connProxy.isSuccess && sshViaProxy.verifyForwarding(4000).isSuccess) {
                             pingMs = connProxy.getOrNull() ?: pingMs
                             establishedSshClient = sshViaProxy
                             activeSshClient = sshViaProxy
+                            verifiedSshMode = "HTTP_CONNECT"
                             verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
                             VpnStateHolder.appendLog(
                                 "PROXY",
@@ -528,7 +555,8 @@ class JeffersVpnService : VpnService() {
                         host = cleanHost,
                         port = 22,
                         username = sshUser,
-                        candidatePasswords = sshCandidatePasswords
+                        candidatePasswords = sshCandidatePasswords,
+                        candidateCredentials = sshCandidateCredentials
                     )
                     val conn22 = ssh22.connect(5500)
                     if (conn22.isSuccess) {
@@ -537,6 +565,7 @@ class JeffersVpnService : VpnService() {
                             pingMs = conn22.getOrNull() ?: pingMs
                             establishedSshClient = ssh22
                             activeSshClient = ssh22
+                            verifiedSshMode = "DIRECT"
                             verifiedChannelLabel = "SSH :22 (respaldo)"
                         } else {
                             sshFallbackErr = fwd22.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
@@ -567,8 +596,8 @@ class JeffersVpnService : VpnService() {
         // Update persisted latency now that end-to-end tunnel passed verification
         repository.updateLatency(profile.id, pingMs)
 
-        val activeDnsPrimary = engineSettings.dnsProvider.primary
-        val activeDnsSecondary = engineSettings.dnsProvider.secondary
+        val activeDnsPrimary = engineSettings.dnsProvider.primary.ifBlank { profile.dnsPrimary }
+        val activeDnsSecondary = engineSettings.dnsProvider.secondary.ifBlank { profile.dnsSecondary }
         val activeMtu = engineSettings.mtu.coerceIn(1200, 1500)
 
         val tunFd = try {
@@ -582,6 +611,9 @@ class JeffersVpnService : VpnService() {
                 .addDnsServer(activeDnsPrimary)
                 .addDnsServer(activeDnsSecondary)
 
+            if (!engineSettings.fullTunnel) {
+                builder.allowBypass()
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.setMetered(false)
             }
@@ -616,7 +648,7 @@ class JeffersVpnService : VpnService() {
         sessionStartedAt = System.currentTimeMillis()
         VpnStateHolder.appendLog(
             "TUN",
-            "TUN 10.8.0.2/32 + fd00:10:8::2/128 MTU $activeMtu activo • Canal=$verifiedChannelLabel",
+            "TUN 10.8.0.2/32 + 0.0.0.0/0 (trampa IPv6 ::/0) MTU $activeMtu • ${if (engineSettings.fullTunnel) "Túnel Completo" else "Estándar"} • DNS=$activeDnsPrimary/$activeDnsSecondary • Canal=$verifiedChannelLabel",
             LogLevel.SUCCESS
         )
 
@@ -659,11 +691,11 @@ class JeffersVpnService : VpnService() {
             allowDirectFallback = false,
             proxySniHost = profile.sniHost.trim(),
             sshClientFactory = { targetPort ->
-                if (protocol == TunnelProtocol.HTTP_CONNECT && targetPort == profile.port) {
-                    SshTunnelClient(
+                when {
+                    verifiedSshMode == "HTTP_CONNECT" -> SshTunnelClient(
                         protectSocket = ::protectSocketSafely,
                         host = cleanHost,
-                        port = targetPort,
+                        port = profile.port,
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
                         customSocketFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
@@ -671,18 +703,34 @@ class JeffersVpnService : VpnService() {
                             protectSocket = ::protectSocketSafely,
                             timeoutMs = 5500,
                             onLog = VpnStateHolder::appendLog
-                        )
+                        ),
+                        candidateCredentials = sshCandidateCredentials
                     )
-                } else {
-                    SshTunnelClient(
+                    verifiedSshMode == "BHTTP_UPGRADE" -> SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = profile.port,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = VpsReachabilityTester.createBhttpUpgradeSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5500,
+                            onLog = VpnStateHolder::appendLog
+                        ),
+                        candidateCredentials = sshCandidateCredentials
+                    )
+                    else -> SshTunnelClient(
                         protectSocket = ::protectSocketSafely,
                         host = cleanHost,
                         port = targetPort,
                         username = sshUser,
-                        candidatePasswords = sshCandidatePasswords
+                        candidatePasswords = sshCandidatePasswords,
+                        candidateCredentials = sshCandidateCredentials
                     )
                 }
-            }
+            },
+            sshCandidateCredentials = sshCandidateCredentials
         )
         activeRelay = relay
 

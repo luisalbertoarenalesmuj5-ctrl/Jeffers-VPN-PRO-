@@ -1310,6 +1310,156 @@ class ExampleUnitTest {
             serverThread.join(1000)
         }
     }
+
+    @Test
+    fun `resolveCredentialCandidates keeps profile SSH credentials first and appends personal credentials as fallback`() {
+        val profile = com.example.data.local.VpnProfileEntity(
+            id = 601L,
+            profileName = "VPS 1",
+            vpsName = "VPS Principal",
+            host = "203.0.113.10",
+            port = 22,
+            username = "root",
+            password = "vps-root-password",
+            carrier = com.example.data.model.CarrierType.TIGO.name,
+            protocol = com.example.data.model.TunnelProtocol.SSH_DIRECT.name,
+            sniHost = "",
+            bhttpPayload = ""
+        )
+
+        val candidates = com.example.vpn.VpsReachabilityTester.resolveCredentialCandidates(
+            profile = profile,
+            personalUsername = "cliente_personal",
+            personalPassword = "user-pass-123"
+        )
+
+        assertTrue(candidates.isNotEmpty())
+        assertEquals("root", candidates.first().username)
+        assertEquals("vps-root-password", candidates.first().password)
+        assertTrue(candidates.any { it.username == "cliente_personal" && it.password == "user-pass-123" })
+        assertTrue(candidates.any { it.username == "root" && it.password == "user-pass-123" })
+        assertTrue(candidates.any { it.username == "cliente_personal" && it.password == "vps-root-password" })
+
+        val profileOnly = com.example.vpn.VpsReachabilityTester.resolveCredentialCandidates(profile)
+        assertEquals(listOf(com.example.vpn.SshCredential("root", "vps-root-password")), profileOnly)
+    }
+
+    @Test
+    fun `dnsSslEngineHelper parses question key rewrites txId and builds SERVFAIL response`() {
+        val query = com.example.vpn.NetworkDiagnosticEngine.buildDnsAQueryPacket("Example.COM", txId = 0x1A2B)
+        assertEquals("example.com:1:1", com.example.vpn.DnsSslEngineHelper.parseQuestionCacheKey(query))
+
+        val otherQuery = com.example.vpn.NetworkDiagnosticEngine.buildDnsAQueryPacket("example.com", txId = 0x9F01)
+        val servFail = com.example.vpn.DnsSslEngineHelper.buildServFailResponse(query)
+        assertNotNull(servFail)
+        servFail!!
+        assertEquals(0x1A.toByte(), servFail[0])
+        assertEquals(0x2B.toByte(), servFail[1])
+        assertEquals(0x80.toByte(), (servFail[2].toInt() and 0x80).toByte()) // QR=1
+        assertEquals(2, servFail[3].toInt() and 0x0F) // RCODE=2 (SERVFAIL)
+        assertEquals(1, ((servFail[4].toInt() and 0xFF) shl 8) or (servFail[5].toInt() and 0xFF))
+
+        val rewritten = com.example.vpn.DnsSslEngineHelper.rewriteTxId(servFail, otherQuery)
+        assertEquals(0x9F.toByte(), rewritten[0])
+        assertEquals(0x01.toByte(), rewritten[1])
+        assertEquals(2, rewritten[3].toInt() and 0x0F)
+    }
+
+    @Test
+    fun `parseVpsKernelAuditOutput distinguishes healthy VPS config from misconfigured forwarding and NAT`() {
+        val healthyRaw = """
+            FWD=1
+            NAT=-A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE;
+            SSHD=AllowTcpForwarding yes;PermitOpen any;
+            DNS=nameserver 1.1.1.1;nameserver 8.8.8.8;
+            UFW=Status: active
+            PORTS=:22,:80,:8080
+        """.trimIndent()
+
+        val passCheck = com.example.vpn.NetworkDiagnosticEngine.parseVpsKernelAuditOutput(healthyRaw, 8080)
+        assertEquals(com.example.data.model.DiagnosticCheckStatus.PASS, passCheck.status)
+        assertTrue(passCheck.detail.contains("ip_forward=1 ✓"))
+        assertTrue(passCheck.detail.contains("MASQUERADE ✓"))
+
+        val brokenRaw = """
+            FWD=0
+            NAT=-P POSTROUTING ACCEPT;
+            SSHD=AllowTcpForwarding no;
+            DNS=
+            UFW=Status: active
+            PORTS=:22
+        """.trimIndent()
+
+        val failCheck = com.example.vpn.NetworkDiagnosticEngine.parseVpsKernelAuditOutput(brokenRaw, 8080)
+        assertEquals(com.example.data.model.DiagnosticCheckStatus.FAIL, failCheck.status)
+        assertTrue(failCheck.detail.contains("ip_forward=0"))
+        assertTrue(failCheck.detail.contains("sin regla NAT MASQUERADE"))
+        assertTrue(failCheck.detail.contains("sshd bloquea AllowTcpForwarding"))
+        assertTrue(failCheck.detail.contains("sin servicio escuchando en :8080"))
+    }
+
+    @Test
+    fun `tunPacketRelay returns immediate DNS SERVFAIL when upstream tunnel is unavailable and direct leak is disabled`() {
+        val tempClosedSocket = ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))
+        val closedPort = tempClosedSocket.localPort
+        tempClosedSocket.close()
+
+        val tunToRelay = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayToTun = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+        val relayScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+        )
+
+        val relay = TunPacketRelay(
+            protectSocket = { true },
+            protectDatagramSocket = { true },
+            tunInputProvider = { PacketQueueInputStream(tunToRelay) },
+            tunOutputProvider = { PacketQueueOutputStream(relayToTun) },
+            dnsPrimaryIp = "1.1.1.1",
+            dnsSecondaryIp = "8.8.8.8",
+            vpsHost = "127.0.0.1",
+            vpsPort = closedPort,
+            vpsUsername = "root",
+            vpsPassword = "secret",
+            sshCandidatePasswords = listOf("secret"),
+            initialSshClient = null,
+            scope = relayScope,
+            mtu = 1400,
+            initialProxyVerified = false,
+            allowDirectFallback = false,
+            sshClientFactory = null,
+            onLog = { _, _, _ -> },
+            onStatusMessage = {}
+        )
+
+        val relayThread = thread(start = true) { relay.runLoop() }
+        try {
+            val dnsQuery = com.example.vpn.NetworkDiagnosticEngine.buildDnsAQueryPacket("vpn.test.local", txId = 0x55AA)
+            val udpDnsReq = TunPacketRelay.buildIpv4UdpPacket(
+                srcIp = byteArrayOf(10, 8, 0, 2),
+                dstIp = byteArrayOf(1, 1, 1, 1),
+                srcPort = 52053,
+                dstPort = 53,
+                payload = dnsQuery
+            )
+            tunToRelay.offer(udpDnsReq)
+
+            val respPacket = relayToTun.poll(4000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            assertNotNull("Expected SERVFAIL DNS packet returned cleanly to TUN", respPacket)
+            respPacket!!
+            assertEquals(17.toByte(), respPacket[9]) // UDP
+            assertEquals(53, readBeUShort(respPacket, 20))
+            assertEquals(52053, readBeUShort(respPacket, 22))
+            assertEquals(0x55.toByte(), respPacket[28])
+            assertEquals(0xAA.toByte(), respPacket[29])
+            assertEquals(2, respPacket[31].toInt() and 0x0F) // RCODE=2 (SERVFAIL)
+        } finally {
+            tunToRelay.offer(ByteArray(0))
+            relay.closeAllSessions()
+            relayScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            relayThread.join(1000)
+        }
+    }
 }
 
 

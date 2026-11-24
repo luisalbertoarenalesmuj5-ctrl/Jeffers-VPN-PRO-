@@ -31,6 +31,39 @@ data class TunnelProbeOutcome(
 
 object VpsReachabilityTester {
 
+    fun resolveCredentialCandidates(
+        profile: VpnProfileEntity,
+        personalUsername: String = "",
+        personalPassword: String = ""
+    ): List<SshCredential> {
+        val profileUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
+        val profilePasswords = resolveCandidatePasswords(profile)
+        val extraUser = personalUsername.trim()
+        val extraPass = personalPassword.trim()
+
+        return buildList {
+            // 1. Always try the VPS profile's configured SSH credentials FIRST so app account logins never break VPS auth
+            profilePasswords.forEach { pwd ->
+                add(SshCredential(profileUser, pwd))
+            }
+            // 2. Append personal tunnel credentials as fallback candidates if configured
+            if (extraUser.isNotEmpty() || extraPass.isNotEmpty()) {
+                val resolvedExtraUser = extraUser.ifBlank { profileUser }
+                if (extraPass.isNotEmpty()) {
+                    add(SshCredential(resolvedExtraUser, extraPass))
+                    if (resolvedExtraUser != profileUser) {
+                        add(SshCredential(profileUser, extraPass))
+                    }
+                }
+                if (extraUser.isNotEmpty() && extraUser != profileUser) {
+                    profilePasswords.forEach { pwd ->
+                        add(SshCredential(extraUser, pwd))
+                    }
+                }
+            }
+        }.distinct()
+    }
+
     fun resolveCandidatePasswords(profile: VpnProfileEntity): List<String> {
         val cleanUser = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
         val cleanPass = profile.password.trim()
@@ -47,14 +80,18 @@ object VpsReachabilityTester {
         }.distinct()
     }
 
-    fun validateProfileConfig(profile: VpnProfileEntity): String? {
+    fun validateProfileConfig(
+        profile: VpnProfileEntity,
+        personalUsername: String = "",
+        personalPassword: String = ""
+    ): String? {
         val host = profile.host.trim()
         if (host.isBlank()) return "IP o dominio del VPS vacío"
         if (host.contains(' ') || host.contains("://")) return "Formato de IP/dominio inválido ($host)"
         if (profile.port !in 1..65535) return "Puerto inválido (${profile.port})"
         val protocol = TunnelProtocol.fromName(profile.protocol)
         if ((protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22) &&
-            resolveCandidatePasswords(profile).isEmpty()
+            resolveCredentialCandidates(profile, personalUsername, personalPassword).isEmpty()
         ) {
             return "Falta contraseña SSH para ${profile.username.ifBlank { "root" }}@$host:${profile.port}"
         }
@@ -64,9 +101,11 @@ object VpsReachabilityTester {
     suspend fun testProfile(
         profile: VpnProfileEntity,
         timeoutMs: Int = 5500,
-        protectSocket: (Socket) -> Boolean = { true }
+        protectSocket: (Socket) -> Boolean = { true },
+        personalUsername: String = "",
+        personalPassword: String = ""
     ): PingTestResult = withContext(Dispatchers.IO) {
-        val configError = validateProfileConfig(profile)
+        val configError = validateProfileConfig(profile, personalUsername, personalPassword)
         if (configError != null) {
             return@withContext PingTestResult(
                 profileId = profile.id,
@@ -81,7 +120,9 @@ object VpsReachabilityTester {
         val outcome = verifyProfileEndToEnd(
             profile = profile,
             timeoutMs = timeoutMs,
-            protectSocket = protectSocket
+            protectSocket = protectSocket,
+            personalUsername = personalUsername,
+            personalPassword = personalPassword
         )
         PingTestResult(
             profileId = profile.id,
@@ -96,13 +137,16 @@ object VpsReachabilityTester {
     private fun verifyProfileEndToEnd(
         profile: VpnProfileEntity,
         timeoutMs: Int,
-        protectSocket: (Socket) -> Boolean
+        protectSocket: (Socket) -> Boolean,
+        personalUsername: String = "",
+        personalPassword: String = ""
     ): TunnelProbeOutcome {
         val host = profile.host.trim()
         val port = profile.port
         val protocol = TunnelProtocol.fromName(profile.protocol)
         val user = profile.username.trim().ifBlank { VpnRepository.DEFAULT_SSH_USER }
         val passwords = resolveCandidatePasswords(profile)
+        val credentials = resolveCredentialCandidates(profile, personalUsername, personalPassword)
 
         // 1. Direct SSH mode (or port 22)
         if (protocol == TunnelProtocol.SSH_DIRECT || port == 22) {
@@ -112,7 +156,8 @@ object VpsReachabilityTester {
                 port = port,
                 username = user,
                 candidatePasswords = passwords,
-                onLog = { _, _, _ -> }
+                onLog = { _, _, _ -> },
+                candidateCredentials = credentials
             )
             return try {
                 val conn = ssh.connect(timeoutMs)
@@ -134,7 +179,7 @@ object VpsReachabilityTester {
                         latencyMs = null,
                         channelLabel = null,
                         httpBanner = null,
-                        errorDetail = "SSH autenticado pero sin reenvío TCP: $reason"
+                        errorDetail = "SSH autenticado pero sin salida/reenvío TCP: $reason"
                     )
                 }
                 val rtt = conn.getOrNull() ?: fwd.getOrNull() ?: 1
@@ -142,7 +187,7 @@ object VpsReachabilityTester {
                     isReachable = true,
                     latencyMs = rtt,
                     channelLabel = "SSH :$port",
-                    httpBanner = "SSH-2.0 autenticado y túnel verificado (${rtt} ms)",
+                    httpBanner = "SSH-2.0 autenticado y salida real verificada (${rtt} ms)",
                     errorDetail = null
                 )
             } finally {
@@ -171,11 +216,12 @@ object VpsReachabilityTester {
                 )
             }
 
-            if (passwords.isNotEmpty()) {
+            if (credentials.isNotEmpty()) {
                 val sshOverProxy = trySshOverHttpConnect(
                     profile = profile,
                     user = user,
                     passwords = passwords,
+                    credentials = credentials,
                     protectSocket = protectSocket,
                     timeoutMs = timeoutMs
                 )
@@ -206,11 +252,12 @@ object VpsReachabilityTester {
         }
 
         // 3a. If server returned 101 Switching Protocols or 200 Connection established, try SSH over upgraded stream
-        if (bhttpResult.canUpgradeToSsh && passwords.isNotEmpty()) {
+        if (bhttpResult.canUpgradeToSsh && credentials.isNotEmpty()) {
             val upgradedSsh = trySshOverBhttpUpgrade(
                 profile = profile,
                 user = user,
                 passwords = passwords,
+                credentials = credentials,
                 protectSocket = protectSocket,
                 timeoutMs = timeoutMs
             )
@@ -239,11 +286,12 @@ object VpsReachabilityTester {
             )
         }
 
-        if (passwords.isNotEmpty()) {
+        if (credentials.isNotEmpty()) {
             val sshOverProxy = trySshOverHttpConnect(
                 profile = profile,
                 user = user,
                 passwords = passwords,
+                credentials = credentials,
                 protectSocket = protectSocket,
                 timeoutMs = timeoutMs
             )
@@ -253,14 +301,15 @@ object VpsReachabilityTester {
         }
 
         // 3c. Check fallback SSH on port 22 with full forwarding verification
-        if (passwords.isNotEmpty()) {
+        if (credentials.isNotEmpty()) {
             val ssh22 = SshTunnelClient(
                 protectSocket = protectSocket,
                 host = host,
                 port = 22,
                 username = user,
                 candidatePasswords = passwords,
-                onLog = { _, _, _ -> }
+                onLog = { _, _, _ -> },
+                candidateCredentials = credentials
             )
             try {
                 val conn = ssh22.connect(timeoutMs.coerceAtMost(4500))
@@ -359,6 +408,7 @@ object VpsReachabilityTester {
         profile: VpnProfileEntity,
         user: String,
         passwords: List<String>,
+        credentials: List<SshCredential>,
         protectSocket: (Socket) -> Boolean,
         timeoutMs: Int
     ): TunnelProbeOutcome? {
@@ -375,7 +425,8 @@ object VpsReachabilityTester {
             username = user,
             candidatePasswords = passwords,
             customSocketFactory = factory,
-            onLog = { _, _, _ -> }
+            onLog = { _, _, _ -> },
+            candidateCredentials = credentials
         )
         return try {
             val conn = ssh.connect(timeoutMs)
@@ -400,6 +451,7 @@ object VpsReachabilityTester {
         profile: VpnProfileEntity,
         user: String,
         passwords: List<String>,
+        credentials: List<SshCredential>,
         protectSocket: (Socket) -> Boolean,
         timeoutMs: Int
     ): TunnelProbeOutcome? {
@@ -416,7 +468,8 @@ object VpsReachabilityTester {
             username = user,
             candidatePasswords = passwords,
             customSocketFactory = factory,
-            onLog = { _, _, _ -> }
+            onLog = { _, _, _ -> },
+            candidateCredentials = credentials
         )
         return try {
             val conn = ssh.connect(timeoutMs)
@@ -661,10 +714,87 @@ object VpsReachabilityTester {
             lastOutcome = outcome
             val code = parseHttpStatusCode(outcome.statusLine)
             // Retry without auth headers only if strict proxy rejected extra headers with 400 or 403
-            if (code !in setOf(400, 403)) break
+            if (code !in setOf(400, 403) && outcome.statusLine?.contains("200") != true) break
+        }
+
+        // Fallback: many Squid/CONNECT proxies restrict CONNECT to SSL port 443 only (denying :80 with 403).
+        val lastCode = parseHttpStatusCode(lastOutcome?.statusLine)
+        if (lastCode == 403 || lastOutcome?.statusLine?.startsWith("HTTP/1.1 200") == true || lastOutcome?.statusLine?.startsWith("HTTP/1.0 200") == true) {
+            val httpsProbe = probeHttpConnectHttpsDoH(
+                host = host,
+                port = port,
+                username = username,
+                password = password,
+                protectSocket = protectSocket,
+                timeoutMs = timeoutMs,
+                sniHost = sniHost
+            )
+            if (httpsProbe.supported) return httpsProbe
         }
 
         return lastOutcome ?: HttpProxyProbeOutcome(false, null, null, "Puerto $port no responde como proxy HTTP CONNECT")
+    }
+
+    private fun probeHttpConnectHttpsDoH(
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        protectSocket: (Socket) -> Boolean,
+        timeoutMs: Int,
+        sniHost: String
+    ): HttpProxyProbeOutcome {
+        val headerModes = if (password.isNotBlank() || username.isNotBlank()) listOf(true, false) else listOf(false)
+        for (includeAuthHeaders in headerModes) {
+            val socket = Socket()
+            try {
+                bindSocketIfNeeded(socket)
+                if (!protectSocket(socket)) {
+                    return HttpProxyProbeOutcome(false, null, null, "No se pudo proteger el socket proxy")
+                }
+                socket.tcpNoDelay = true
+                val startNs = System.nanoTime()
+                socket.connect(InetSocketAddress(host.trim(), port), timeoutMs)
+                socket.soTimeout = timeoutMs
+
+                val req = buildHttpConnectRequest(
+                    dstHost = "1.1.1.1",
+                    dstPort = 443,
+                    username = username,
+                    password = password,
+                    sniHost = sniHost,
+                    includeAuthHeaders = includeAuthHeaders
+                )
+                socket.getOutputStream().write(req.toByteArray(Charsets.UTF_8))
+                socket.getOutputStream().flush()
+
+                val headers = readHttpHeadersExact(socket.getInputStream())
+                val statusLine = headers?.lineSequence()?.firstOrNull()?.trim()
+                val code = parseHttpStatusCode(statusLine)
+                if (code in 200..299) {
+                    val dohResp = DnsSslEngineHelper.executeDoHOverStreams(
+                        input = socket.getInputStream(),
+                        output = socket.getOutputStream(),
+                        sniHost = "1.1.1.1",
+                        dnsQuery = NetworkDiagnosticEngine.buildDnsAQueryPacket("google.com"),
+                        timeoutMs = timeoutMs,
+                        onTimeoutClose = { try { socket.close() } catch (_: Exception) {} }
+                    )
+                    if (dohResp != null && dohResp.size >= 12) {
+                        val totalRtt = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
+                        return HttpProxyProbeOutcome(true, totalRtt, statusLine, null)
+                    }
+                    break
+                } else if (code !in setOf(400, 403)) {
+                    break
+                }
+            } catch (_: Exception) {
+                break
+            } finally {
+                try { socket.close() } catch (_: Exception) {}
+            }
+        }
+        return HttpProxyProbeOutcome(false, null, null, null)
     }
 
     fun bindSocketIfNeeded(socket: Socket) {

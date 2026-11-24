@@ -390,7 +390,9 @@ fun HomeScreen(
                         pingMs = telemetry.pingMs ?: activeProfile?.lastLatencyMs,
                         primaryColor = primaryColor,
                         accentColor = accentColor,
-                        isChristmasTheme = isChristmasTheme
+                        isChristmasTheme = isChristmasTheme,
+                        serverName = activeProfile?.profileName ?: telemetry.activeProfileName,
+                        onDisconnectClick = onToggleConnect
                     )
                 }
 

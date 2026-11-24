@@ -715,11 +715,15 @@ private fun HttpConnectProxyDeployCard(
 ) {
     val totalCount = uiState.profiles.size
     val httpConnectCount = uiState.profiles.count { it.protocol == TunnelProtocol.HTTP_CONNECT.name }
-    var proxyFlavor by remember { mutableIntStateOf(0) } // 0 = SSH-Bridge (:8080/:80), 1 = Squid Full (:8080)
+    var proxyFlavor by remember { mutableIntStateOf(0) } // 0 = SSH-Bridge (:8080/:80), 1 = Squid Full (:8080), 2 = Red VPS (NAT/Forward/FW)
     var copiedNotice by remember { mutableStateOf<String?>(null) }
 
     val selectedCommand = remember(proxyFlavor) {
-        if (proxyFlavor == 0) VPS_HTTP_CONNECT_SSH_BRIDGE_CMD else VPS_SQUID_CONNECT_CMD
+        when (proxyFlavor) {
+            0 -> VPS_HTTP_CONNECT_SSH_BRIDGE_CMD
+            1 -> VPS_SQUID_CONNECT_CMD
+            else -> VPS_NETWORK_REPAIR_CMD
+        }
     }
 
     Surface(
@@ -761,7 +765,7 @@ private fun HttpConnectProxyDeployCard(
             }
 
             Text(
-                text = "Activa HTTP CONNECT en tus perfiles guardados (sin borrar IPs ni contraseñas) e instala el proxy en tus VPS si el puerto 80/8080 aún responde 302.",
+                text = "Activa HTTP CONNECT en tus perfiles guardados (sin borrar IPs ni contraseñas), o copia el comando de reparación de red VPS (IP forwarding, NAT MASQUERADE, firewall y DNS).",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
@@ -812,6 +816,15 @@ private fun HttpConnectProxyDeployCard(
                         copiedNotice = null
                     },
                     label = { Text("Squid Completo (:8080)") },
+                    modifier = Modifier.height(44.dp)
+                )
+                FilterChip(
+                    selected = proxyFlavor == 2,
+                    onClick = {
+                        proxyFlavor = 2
+                        copiedNotice = null
+                    },
+                    label = { Text("Reparar Red VPS (Forward/NAT/FW)") },
                     modifier = Modifier.height(44.dp)
                 )
             }
@@ -918,6 +931,9 @@ printf "[Unit]\nDescription=Jeffers HTTP CONNECT Proxy\nAfter=network.target\n[S
 
 private val VPS_SQUID_CONNECT_CMD =
     "sudo bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y squid && printf \"http_port 8080\\nacl Safe_ports port 22 53 80 443\\nacl CONNECT method CONNECT\\nhttp_access allow CONNECT Safe_ports\\nhttp_access allow all\\n\" >/etc/squid/conf.d/jeffers-connect.conf && systemctl enable --now squid && systemctl restart squid && (ufw allow 8080/tcp 2>/dev/null; true) && systemctl status squid --no-pager'"
+
+private val VPS_NETWORK_REPAIR_CMD =
+    "sudo bash -c 'IFACE=\$(ip route show default | awk \"/default/ {print \\\$5; exit}\"); echo \"net.ipv4.ip_forward=1\" >/etc/sysctl.d/99-jeffers-vpn.conf && sysctl -w net.ipv4.ip_forward=1 && (iptables -t nat -C POSTROUTING -o \$IFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \$IFACE -j MASQUERADE) && sed -i \"s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/; s/^#*PermitOpen.*/PermitOpen any/\" /etc/ssh/sshd_config && grep -q \"^AllowTcpForwarding\" /etc/ssh/sshd_config || echo \"AllowTcpForwarding yes\" >>/etc/ssh/sshd_config && systemctl reload ssh 2>/dev/null || systemctl reload sshd && (ufw allow 22/tcp; ufw allow 53/tcp; ufw allow 53/udp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 8080/tcp) 2>/dev/null || true; grep -q nameserver /etc/resolv.conf || printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" >>/etc/resolv.conf; echo \"OK IFACE=\$IFACE FWD=\$(cat /proc/sys/net/ipv4/ip_forward)\"'"
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable

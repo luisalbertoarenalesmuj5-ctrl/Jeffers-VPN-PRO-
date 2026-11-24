@@ -54,7 +54,8 @@ class TunPacketRelay internal constructor(
     },
     private val onDiagnostics: ((TunnelDiagnosticsState) -> TunnelDiagnosticsState) -> Unit = { transform ->
         VpnStateHolder.updateDiagnostics(transform)
-    }
+    },
+    private val sshCandidateCredentials: List<SshCredential> = emptyList()
 ) {
     constructor(
         vpnService: VpnService,
@@ -88,11 +89,11 @@ class TunPacketRelay internal constructor(
         mtu = mtu,
         initialProxyVerified = initialProxyVerified,
         allowDirectFallback = allowDirectFallback,
-        sshClientFactory = {
+        sshClientFactory = { targetPort ->
             SshTunnelClient(
                 vpnService = vpnService,
                 host = vpsHost,
-                port = 22,
+                port = targetPort,
                 username = vpsUsername,
                 candidatePasswords = sshCandidatePasswords
             )
@@ -109,6 +110,7 @@ class TunPacketRelay internal constructor(
     private val writeLock = Any()
     private val tcpSessions = ConcurrentHashMap<TcpSessionKey, TcpSession>()
     private val udpSessions = ConcurrentHashMap<UdpSessionKey, UdpSession>()
+    private val dnsCache = ConcurrentHashMap<String, CachedDnsEntry>()
     private val proxyProbeMutex = Mutex()
     private val sshConnectMutex = Mutex()
 
@@ -123,6 +125,8 @@ class TunPacketRelay internal constructor(
 
     @Volatile
     private var sshFallbackCooldownUntil: Long = 0L
+
+    private val sshReconnectCooldownUntil = AtomicLong(0L)
 
     @Volatile
     private var vpsSupportsConnect: Boolean = initialProxyVerified
@@ -144,6 +148,11 @@ class TunPacketRelay internal constructor(
     private val loggedQuicReject = AtomicBoolean(false)
     private val lastProxyFailLogAt = AtomicLong(0L)
     private val tcpFailStreak = AtomicLong(0L)
+
+    private data class CachedDnsEntry(
+        val payload: ByteArray,
+        val expiresAtMs: Long
+    )
 
     private data class TcpSessionKey(
         val srcPort: Int,
@@ -575,9 +584,11 @@ class TunPacketRelay internal constructor(
         activeSshClient?.let { current ->
             if (current.isConnected()) return current
         }
-        val factory = sshClientFactory ?: return null
-        if (sshCandidatePasswords.isEmpty()) return null
+        if (sshCandidatePasswords.isEmpty() && sshCandidateCredentials.isEmpty()) {
+            if (initialSshClient == null) return null
+        }
         val now = System.currentTimeMillis()
+        if (initialSshClient != null && now < sshReconnectCooldownUntil.get()) return null
         if (initialSshClient == null && now < sshFallbackCooldownUntil) return null
 
         return sshConnectMutex.withLock {
@@ -585,28 +596,33 @@ class TunPacketRelay internal constructor(
                 if (locked.isConnected()) return@withLock locked
             }
             if (initialSshClient != null) {
-                val result = initialSshClient.connect(4000)
+                if (System.currentTimeMillis() < sshReconnectCooldownUntil.get()) return@withLock null
+                val result = initialSshClient.connect(5000)
                 return@withLock if (result.isSuccess) {
                     activeSshClient = initialSshClient
+                    sshReconnectCooldownUntil.set(0L)
                     initialSshClient
                 } else {
+                    sshReconnectCooldownUntil.set(System.currentTimeMillis() + 10_000L)
                     null
                 }
             }
+            val factory = sshClientFactory ?: return@withLock null
             if (System.currentTimeMillis() < sshFallbackCooldownUntil) return@withLock null
 
-            onLog("SSH", "Probando respaldo SSH en $vpsHost:22 ($vpsUsername)…", LogLevel.INFO)
-            val candidate = factory(22)
+            val targetPort = if (vpsPort == 22) 22 else 22
+            onLog("SSH", "Probando túnel SSH en $vpsHost:$targetPort ($vpsUsername)…", LogLevel.INFO)
+            val candidate = factory(targetPort)
             val result = candidate.connect(4500)
             if (result.isSuccess) {
                 ownedFallbackSshClient?.disconnect()
                 ownedFallbackSshClient = candidate
                 activeSshClient = candidate
-                onStatusMessage("Túnel SSH activo • $vpsHost:22")
-                onDiagnostics { it.copy(tunnelMode = "SSH Respaldo ($vpsHost:22)") }
+                onStatusMessage("Túnel SSH activo • $vpsHost:$targetPort")
+                onDiagnostics { it.copy(tunnelMode = "SSH Respaldo ($vpsHost:$targetPort)") }
                 onLog(
                     "SSH",
-                    "Puerto $vpsPort sin proxy HTTP CONNECT; túnel SSH activo vía $vpsHost:22 ($vpsUsername)",
+                    "Túnel SSH activo vía $vpsHost:$targetPort ($vpsUsername)",
                     LogLevel.SUCCESS
                 )
                 candidate
@@ -615,7 +631,7 @@ class TunPacketRelay internal constructor(
                 val errMsg = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Sin respuesta"
                 onLog(
                     "SSH",
-                    "Respaldo SSH en $vpsHost:22 no disponible ($errMsg)",
+                    "Respaldo SSH en $vpsHost:$targetPort no disponible ($errMsg)",
                     LogLevel.WARNING
                 )
                 candidate.disconnect()
@@ -750,9 +766,9 @@ class TunPacketRelay internal constructor(
         var activeUpstream: UpstreamTcpStream? = null
         var transportLabel = if (allowDirectFallback) "DIRECTO" else "VPS"
         try {
-            // 1. Prefer real SSH direct-tcpip tunnel when active
+            // 1. Prefer real SSH direct-tcpip tunnel when active (including auto-reconnect for SSH :22)
             var ssh = activeSshClient?.takeIf { it.isConnected() } ?: run {
-                if (initialSshClient != null) ensureSshFallbackConnected() else null
+                if (initialSshClient != null || vpsPort == 22) ensureSshFallbackConnected() else null
             }
             if (ssh != null) {
                 val stream = ssh.openDirectTcpIp(dstHost, session.key.dstPort, 4500)
@@ -1187,97 +1203,29 @@ class TunPacketRelay internal constructor(
         val srcPort = readUShort(requestPacket, udpOffset)
         val dstPort = readUShort(requestPacket, udpOffset + 2)
 
-        val candidates = listOf(dnsPrimaryIp, dnsSecondaryIp, "8.8.8.8", "1.1.1.1").distinct()
+        val candidates = listOf(dnsPrimaryIp, dnsSecondaryIp, "1.1.1.1", "8.8.8.8")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
         val dnsStartNs = System.nanoTime()
         var lastDnsErr: String? = null
+        val cacheKey = DnsSslEngineHelper.parseQuestionCacheKey(dnsPayload)
 
-        // If startup proxy/SSH probe is actively handshaking right now, wait briefly so first DNS queries use SSH
-        if (activeSshClient == null && !vpsSupportsConnect) {
-            val probe = startupProbeJob
-            if (probe != null && probe.isActive) {
-                kotlinx.coroutines.withTimeoutOrNull(1200L) {
-                    probe.join()
-                }
-            }
-        }
-
-        // When an SSH tunnel is active, resolve DNS over TCP through the VPS SSH tunnel with hard 1s read timeout
-        suspend fun resolveDnsViaSsh(ssh: SshTunnelClient): Boolean {
-            for (dnsIp in candidates.take(2)) {
-                var sshDns: SshTcpStream? = null
-                var timeoutJob: Job? = null
-                try {
-                    sshDns = ssh.openDirectTcpIp(dnsIp, DNS_PORT, 1000)
-                    if (sshDns != null) {
-                        val activeChannel = sshDns
-                        timeoutJob = scope.launch(Dispatchers.IO) {
-                            kotlinx.coroutines.delay(1000L)
-                            activeChannel.close()
-                        }
-                        val framedQuery = ByteArray(2 + dnsPayload.size)
-                        framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
-                        framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
-                        System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
-                        activeChannel.outputStream.write(framedQuery)
-                        activeChannel.outputStream.flush()
-
-                        val inStream = activeChannel.inputStream
-                        val lenHi = inStream.read()
-                        val lenLo = inStream.read()
-                        if (lenHi >= 0 && lenLo >= 0) {
-                            val respLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
-                            if (respLen in 12..4096) {
-                                val responsePayload = ByteArray(respLen)
-                                var readTotal = 0
-                                while (readTotal < respLen) {
-                                    val r = inStream.read(responsePayload, readTotal, respLen - readTotal)
-                                    if (r <= 0) break
-                                    readTotal += r
-                                }
-                                if (readTotal == respLen) {
-                                    val finalPayload = if (respLen <= maxUdpPayload) {
-                                        responsePayload
-                                    } else {
-                                        responsePayload.copyOf(512.coerceAtMost(maxUdpPayload)).also { tcResp ->
-                                            tcResp[2] = (tcResp[2].toInt() or 0x02).toByte()
-                                        }
-                                    }
-                                    val ipPacket = buildIpv4UdpPacket(
-                                        srcIp = dstIp,
-                                        dstIp = srcIp,
-                                        srcPort = dstPort,
-                                        dstPort = srcPort,
-                                        payload = finalPayload
-                                    )
-                                    writePacketToTun(ipPacket, output)
-                                    val ms = ((System.nanoTime() - dnsStartNs) / 1_000_000L).coerceAtLeast(1L)
-                                    onDiagnostics {
-                                        it.copy(
-                                            dnsOkCount = it.dnsOkCount + 1,
-                                            lastDnsDetail = "SSH-TCP $dnsIp (${ms}ms)"
-                                        )
-                                    }
-                                    if (loggedFirstDnsOk.compareAndSet(false, true)) {
-                                        onLog("DNS", "DNS resuelto vía SSH-TCP ($dnsIp • ${ms}ms)", LogLevel.SUCCESS)
-                                    }
-                                    return true
-                                }
-                            }
-                        }
-                    } else {
-                        lastDnsErr = "SSH direct-tcpip $dnsIp:53 rechazado"
+        fun emitDnsResponse(responsePayload: ByteArray, sourceLabel: String, storeInCache: Boolean = true) {
+            if (storeInCache && cacheKey != null && responsePayload.size >= 12) {
+                val rcode = responsePayload[3].toInt() and 0x0F
+                if (rcode == 0) {
+                    if (dnsCache.size > 256) {
+                        val nowMs = System.currentTimeMillis()
+                        dnsCache.entries.removeIf { it.value.expiresAtMs < nowMs }
+                        if (dnsCache.size > 256) dnsCache.clear()
                     }
-                } catch (e: Exception) {
-                    lastDnsErr = "SSH DNS $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
-                } finally {
-                    timeoutJob?.cancel()
-                    sshDns?.close()
+                    dnsCache[cacheKey] = CachedDnsEntry(
+                        payload = responsePayload.copyOf(),
+                        expiresAtMs = System.currentTimeMillis() + 30_000L
+                    )
                 }
             }
-            return false
-        }
-
-        fun emitDnsResponse(responsePayload: ByteArray, sourceLabel: String) {
             val finalPayload = if (responsePayload.size <= maxUdpPayload) {
                 responsePayload
             } else {
@@ -1305,9 +1253,114 @@ class TunPacketRelay internal constructor(
             }
         }
 
-        // 1. When SSH tunnel is active, resolve DNS over TCP through SSH direct-tcpip
-        val initialSsh = activeSshClient?.takeIf { it.isConnected() }
-        if (initialSsh != null && resolveDnsViaSsh(initialSsh)) {
+        // 0. Fast path: short-TTL in-memory cache of previously verified DNS replies
+        if (cacheKey != null) {
+            val cached = dnsCache[cacheKey]
+            if (cached != null) {
+                if (System.currentTimeMillis() <= cached.expiresAtMs) {
+                    emitDnsResponse(
+                        responsePayload = DnsSslEngineHelper.rewriteTxId(cached.payload, dnsPayload),
+                        sourceLabel = "Cache-DNS",
+                        storeInCache = false
+                    )
+                    return
+                } else {
+                    dnsCache.remove(cacheKey, cached)
+                }
+            }
+        }
+
+        // If startup proxy/SSH probe is actively handshaking right now, wait briefly so first DNS queries use SSH
+        if (activeSshClient == null && !vpsSupportsConnect) {
+            val probe = startupProbeJob
+            if (probe != null && probe.isActive) {
+                kotlinx.coroutines.withTimeoutOrNull(1500L) {
+                    probe.join()
+                }
+            }
+        }
+
+        // When an SSH tunnel is active, resolve DNS over TCP :53 first, then DoH :443 over SSH direct-tcpip
+        suspend fun resolveDnsViaSsh(ssh: SshTunnelClient): Boolean {
+            for (dnsIp in candidates.take(3)) {
+                var sshDns: SshTcpStream? = null
+                var timeoutJob: Job? = null
+                try {
+                    sshDns = ssh.openDirectTcpIp(dnsIp, DNS_PORT, 2500)
+                    if (sshDns != null) {
+                        val activeChannel = sshDns
+                        timeoutJob = scope.launch(Dispatchers.IO) {
+                            kotlinx.coroutines.delay(2800L)
+                            activeChannel.close()
+                        }
+                        val framedQuery = ByteArray(2 + dnsPayload.size)
+                        framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
+                        framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
+                        System.arraycopy(dnsPayload, 0, framedQuery, 2, dnsPayload.size)
+                        activeChannel.outputStream.write(framedQuery)
+                        activeChannel.outputStream.flush()
+
+                        val inStream = activeChannel.inputStream
+                        val lenHi = inStream.read()
+                        val lenLo = inStream.read()
+                        if (lenHi >= 0 && lenLo >= 0) {
+                            val respLen = ((lenHi and 0xFF) shl 8) or (lenLo and 0xFF)
+                            if (respLen in 12..4096) {
+                                val responsePayload = ByteArray(respLen)
+                                var readTotal = 0
+                                while (readTotal < respLen) {
+                                    val r = inStream.read(responsePayload, readTotal, respLen - readTotal)
+                                    if (r <= 0) break
+                                    readTotal += r
+                                }
+                                if (readTotal == respLen) {
+                                    emitDnsResponse(responsePayload, "SSH-TCP $dnsIp")
+                                    return true
+                                }
+                            }
+                        }
+                    } else {
+                        lastDnsErr = "SSH direct-tcpip $dnsIp:53 rechazado"
+                    }
+                } catch (e: Exception) {
+                    lastDnsErr = "SSH DNS $dnsIp: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                } finally {
+                    timeoutJob?.cancel()
+                    sshDns?.close()
+                }
+            }
+
+            // Fallback inside SSH tunnel: DNS-over-HTTPS (port 443) when VPS or ISP blocks TCP :53
+            for (dohHost in listOf("1.1.1.1", "8.8.8.8")) {
+                val sshDoH = ssh.openDirectTcpIp(dohHost, 443, 3000) ?: continue
+                try {
+                    val dohResp = DnsSslEngineHelper.executeDoHOverStreams(
+                        input = sshDoH.inputStream,
+                        output = sshDoH.outputStream,
+                        sniHost = dohHost,
+                        dnsQuery = dnsPayload,
+                        timeoutMs = 3500,
+                        onTimeoutClose = { sshDoH.close() }
+                    )
+                    if (dohResp != null && dohResp.size >= 12) {
+                        emitDnsResponse(dohResp, "SSH-DoH $dohHost:443")
+                        return true
+                    }
+                } catch (e: Exception) {
+                    lastDnsErr = "SSH DoH $dohHost: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                } finally {
+                    sshDoH.close()
+                }
+            }
+            return false
+        }
+
+        // 1. When SSH tunnel is active (or reconnectable for SSH :22), resolve DNS through SSH direct-tcpip
+        var currentSsh = activeSshClient?.takeIf { it.isConnected() }
+        if (currentSsh == null && (initialSshClient != null || vpsPort == 22)) {
+            currentSsh = ensureSshFallbackConnected()
+        }
+        if (currentSsh != null && resolveDnsViaSsh(currentSsh)) {
             return
         }
 
@@ -1317,7 +1370,7 @@ class TunPacketRelay internal constructor(
                 var tcpSocket: Socket? = null
                 try {
                     tcpSocket = openProxyConnectSocket(dnsIp, DNS_PORT) ?: continue
-                    tcpSocket.soTimeout = 1500
+                    tcpSocket.soTimeout = 2000
                     val framedQuery = ByteArray(2 + dnsPayload.size)
                     framedQuery[0] = ((dnsPayload.size ushr 8) and 0xFF).toByte()
                     framedQuery[1] = (dnsPayload.size and 0xFF).toByte()
@@ -1352,10 +1405,12 @@ class TunPacketRelay internal constructor(
             }
 
             // DoH over port 443 via proxy (works even when proxy blocks port 53)
-            val dohPayload = resolveDnsViaProxyDoH(dnsPayload)
-            if (dohPayload != null) {
-                emitDnsResponse(dohPayload, "Proxy-DoH 1.1.1.1:443")
-                return
+            for (dohHost in listOf("1.1.1.1", "8.8.8.8")) {
+                val dohPayload = resolveDnsViaProxyDoH(dnsPayload, dohHost)
+                if (dohPayload != null) {
+                    emitDnsResponse(dohPayload, "Proxy-DoH $dohHost:443")
+                    return
+                }
             }
         }
 
@@ -1395,6 +1450,18 @@ class TunPacketRelay internal constructor(
             }
         }
 
+        // Return a real DNS SERVFAIL packet so Android apps don't stall waiting 10-15s per blocked domain
+        DnsSslEngineHelper.buildServFailResponse(dnsPayload)?.let { servFail ->
+            val ipPacket = buildIpv4UdpPacket(
+                srcIp = dstIp,
+                dstIp = srcIp,
+                srcPort = dstPort,
+                dstPort = srcPort,
+                payload = servFail
+            )
+            writePacketToTun(ipPacket, output)
+        }
+
         val reason = lastDnsErr ?: "Sin respuesta DNS por túnel en ${candidates.joinToString()}"
         onDiagnostics {
             it.copy(
@@ -1409,18 +1476,18 @@ class TunPacketRelay internal constructor(
         }
     }
 
-    private fun resolveDnsViaProxyDoH(dnsPayload: ByteArray): ByteArray? {
-        val rawProxy = openProxyConnectSocket("1.1.1.1", 443) ?: return null
+    private fun resolveDnsViaProxyDoH(dnsPayload: ByteArray, dohHost: String = "1.1.1.1"): ByteArray? {
+        val rawProxy = openProxyConnectSocket(dohHost, 443) ?: return null
         var sslSocket: javax.net.ssl.SSLSocket? = null
         return try {
             val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
-            sslSocket = (factory.createSocket(rawProxy, "1.1.1.1", 443, true) as javax.net.ssl.SSLSocket).apply {
-                soTimeout = 2500
+            sslSocket = (factory.createSocket(rawProxy, dohHost, 443, true) as javax.net.ssl.SSLSocket).apply {
+                soTimeout = 3000
                 startHandshake()
             }
             val reqHeader = buildString {
                 append("POST /dns-query HTTP/1.1\r\n")
-                append("Host: 1.1.1.1\r\n")
+                append("Host: $dohHost\r\n")
                 append("Content-Type: application/dns-message\r\n")
                 append("Accept: application/dns-message\r\n")
                 append("Content-Length: ${dnsPayload.size}\r\n")

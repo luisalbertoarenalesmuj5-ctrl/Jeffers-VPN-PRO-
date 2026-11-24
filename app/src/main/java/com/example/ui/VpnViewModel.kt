@@ -938,7 +938,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "Probando ${country.titleName} • ${carrier.displayName} (${planTier.badgeLabel}) hacia ${probeProfile.host}:${probeProfile.port}…",
                 LogLevel.INFO
             )
-            val result = VpsReachabilityTester.testProfile(probeProfile)
+            val currentSettings = settingsStore.settings.value
+            val result = VpsReachabilityTester.testProfile(
+                profile = probeProfile,
+                personalUsername = currentSettings.personalTunnelUsername,
+                personalPassword = currentSettings.personalTunnelPassword
+            )
             _lastPingResult.value = result
             if (result.isReachable) {
                 val s = settingsStore.settings.value
@@ -991,7 +996,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 "Verificando ${profile.profileName} (${profile.host}:${profile.port} • ${profile.protocol})…",
                 LogLevel.INFO
             )
-            val result = VpsReachabilityTester.testProfile(profile)
+            val currentSettings = settingsStore.settings.value
+            val result = VpsReachabilityTester.testProfile(
+                profile = profile,
+                personalUsername = currentSettings.personalTunnelUsername,
+                personalPassword = currentSettings.personalTunnelPassword
+            )
             _lastPingResult.value = result
             val currentTelemetry = VpnStateHolder.telemetry.value
             val isConnectedTunnel = currentTelemetry.status == VpnConnectionStatus.CONNECTED &&
@@ -1065,7 +1075,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     profilesToCheck.map { profile ->
                         async {
                             limiter.withPermit {
-                                val res = VpsReachabilityTester.testProfile(profile)
+                                val currentSettings = settingsStore.settings.value
+                                val res = VpsReachabilityTester.testProfile(
+                                    profile = profile,
+                                    personalUsername = currentSettings.personalTunnelUsername,
+                                    personalPassword = currentSettings.personalTunnelPassword
+                                )
                                 val telemetryNow = VpnStateHolder.telemetry.value
                                 val isConnectedTunnel = telemetryNow.status == VpnConnectionStatus.CONNECTED &&
                                     telemetryNow.activeProfileId == profile.id
