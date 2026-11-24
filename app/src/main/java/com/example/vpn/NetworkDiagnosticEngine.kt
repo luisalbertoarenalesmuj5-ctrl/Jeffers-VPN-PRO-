@@ -262,28 +262,44 @@ object NetworkDiagnosticEngine {
             socket.getOutputStream().write(payload)
             socket.getOutputStream().flush()
 
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-            var readErr: String? = null
-            val statusLine = try {
-                reader.readLine()
-            } catch (e: Exception) {
-                readErr = e.localizedMessage ?: e.javaClass.simpleName
-                null
-            }
+            val headers = VpsReachabilityTester.readHttpHeadersExact(socket.getInputStream())
+            val statusLine = headers?.lineSequence()?.firstOrNull()?.trim()
+            val statusCode = VpsReachabilityTester.parseHttpStatusCode(statusLine)
+            val location = VpsReachabilityTester.extractHeaderValue(headers, "Location")
+            val serverHdr = VpsReachabilityTester.extractHeaderValue(headers, "Server")
             val totalMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-            if (statusLine != null) {
-                NetworkDiagnosticCheck(
+
+            val locNote = location?.let { " • Location=$it" }.orEmpty()
+            val srvNote = serverHdr?.let { " • Server=$it" }.orEmpty()
+            val isUpgradeOk = statusCode == 101 ||
+                (statusCode in 200..299 && !headers.orEmpty().lowercase().contains("content-type: text/html"))
+
+            when {
+                isUpgradeOk -> NetworkDiagnosticCheck(
                     id = "vps_bhttp",
                     title = "VPS BHTTP (${profile.host}:${profile.port})",
-                    detail = "TCP ${connectMs}ms • Respuesta servidor: '$statusLine'",
+                    detail = "TCP ${connectMs}ms • Upgrade válido: '$statusLine'$srvNote",
                     status = DiagnosticCheckStatus.PASS,
                     latencyMs = totalMs
                 )
-            } else {
-                NetworkDiagnosticCheck(
+                statusCode in 300..399 -> NetworkDiagnosticCheck(
                     id = "vps_bhttp",
                     title = "VPS BHTTP (${profile.host}:${profile.port})",
-                    detail = "Puerto TCP abierto en ${connectMs}ms, pero sin cabecera HTTP BHTTP (${readErr ?: "EOF"}). Si el VPS no reenvía datos aquí, requiere SSH :22 o proxy.",
+                    detail = "TCP ${connectMs}ms • Redirigido '$statusLine'$locNote$srvNote (no actúa como túnel HTTP/WS)",
+                    status = DiagnosticCheckStatus.WARN,
+                    latencyMs = totalMs
+                )
+                statusLine != null -> NetworkDiagnosticCheck(
+                    id = "vps_bhttp",
+                    title = "VPS BHTTP (${profile.host}:${profile.port})",
+                    detail = "TCP ${connectMs}ms • Respuesta no-túnel: '$statusLine'$locNote$srvNote",
+                    status = DiagnosticCheckStatus.WARN,
+                    latencyMs = totalMs
+                )
+                else -> NetworkDiagnosticCheck(
+                    id = "vps_bhttp",
+                    title = "VPS BHTTP (${profile.host}:${profile.port})",
+                    detail = "Puerto TCP abierto en ${connectMs}ms, pero sin cabecera HTTP BHTTP (EOF/timeout). Requiere proxy CONNECT o SSH :22.",
                     status = DiagnosticCheckStatus.WARN,
                     latencyMs = totalMs
                 )
@@ -356,9 +372,14 @@ object NetworkDiagnosticEngine {
             socket.getOutputStream().write(req.toByteArray(Charsets.UTF_8))
             socket.getOutputStream().flush()
 
-            val statusLine = BufferedReader(InputStreamReader(socket.getInputStream())).readLine()
+            val headers = VpsReachabilityTester.readHttpHeadersExact(socket.getInputStream())
+            val statusLine = headers?.lineSequence()?.firstOrNull()?.trim()
             val ms = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
             val code = VpsReachabilityTester.parseHttpStatusCode(statusLine)
+            val loc = VpsReachabilityTester.extractHeaderValue(headers, "Location") ?: externalProbe.locationHeader
+            val srv = VpsReachabilityTester.extractHeaderValue(headers, "Server")
+            val locNote = loc?.let { " • Location=$it" }.orEmpty()
+            val srvNote = srv?.let { " • Server=$it" }.orEmpty()
             when {
                 code in 200..299 -> NetworkDiagnosticCheck(
                     id = "proxy_connect",
@@ -370,7 +391,7 @@ object NetworkDiagnosticEngine {
                 statusLine != null -> NetworkDiagnosticCheck(
                     id = "proxy_connect",
                     title = "Proxy HTTP CONNECT (:${profile.port})",
-                    detail = "Puerto ${profile.port} rechazó HTTP CONNECT con '$statusLine' (${ms}ms). Instala o activa el proxy HTTP CONNECT en el VPS.",
+                    detail = "Puerto ${profile.port} rechazó HTTP CONNECT con '$statusLine'$locNote$srvNote (${ms}ms).",
                     status = DiagnosticCheckStatus.WARN,
                     latencyMs = ms
                 )
@@ -420,6 +441,7 @@ object NetworkDiagnosticEngine {
         val bannerSocket = Socket()
         var bannerText: String? = null
         var bannerMs = 1
+        var port22Error: String? = null
         var useHttpConnectBridge = false
         try {
             val startNs = System.nanoTime()
@@ -429,11 +451,16 @@ object NetworkDiagnosticEngine {
             bannerMs = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
         } catch (e: Exception) {
             try { bannerSocket.close() } catch (_: Exception) {}
+            port22Error = when (e) {
+                is java.net.SocketTimeoutException -> "Timeout en :22 (operadora o firewall bloquea puerto 22)"
+                is java.net.ConnectException -> "Conexión rechazada en :22 (SSHD apagado o puerto cerrado)"
+                else -> e.localizedMessage ?: e.javaClass.simpleName
+            }
             if (profile.port == 22) {
                 return NetworkDiagnosticCheck(
                     id = "ssh_tunnel",
                     title = "Túnel SSH ($cleanHost:22)",
-                    detail = "Puerto 22 inaccesible: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                    detail = "Puerto 22 inaccesible: $port22Error",
                     status = DiagnosticCheckStatus.FAIL
                 ) to null
             }
@@ -441,6 +468,8 @@ object NetworkDiagnosticEngine {
         } finally {
             try { bannerSocket.close() } catch (_: Exception) {}
         }
+
+        val port443Open = if (useHttpConnectBridge) probeTcpReachable(cleanHost, 443, 1800) else null
 
         val probeSsh = if (useHttpConnectBridge) {
             SshTunnelClient(
@@ -475,12 +504,22 @@ object NetworkDiagnosticEngine {
             if (connectResult.isFailure) {
                 val err = connectResult.exceptionOrNull()?.localizedMessage ?: "Error autenticación SSH"
                 val portDesc = if (useHttpConnectBridge) "${profile.port} (CONNECT→22)" else "22"
+                val detailMsg = if (useHttpConnectBridge) {
+                    val tlsHint = when (port443Open) {
+                        true -> " • Puerto :443 TCP abierto (prueba SSL/TLS + SNI en :443)"
+                        false -> " • Puerto :443 también cerrado/filtrado"
+                        null -> ""
+                    }
+                    "Puerto :22 directo falló ($port22Error) y puente en :${profile.port} rechazado: $err$tlsHint"
+                } else {
+                    "Banner '${bannerText ?: "SSH-2.0"}' (${bannerMs}ms), pero falló login '${credentials.firstOrNull()?.username ?: user}': $err"
+                }
                 return NetworkDiagnosticCheck(
                     id = "ssh_tunnel",
                     title = "Túnel SSH ($cleanHost:$portDesc)",
-                    detail = "Banner '${bannerText ?: "SSH"}' (${bannerMs}ms), pero falló login '${credentials.firstOrNull()?.username ?: user}': $err",
+                    detail = detailMsg,
                     status = DiagnosticCheckStatus.FAIL,
-                    latencyMs = bannerMs
+                    latencyMs = if (useHttpConnectBridge) null else bannerMs
                 ) to null
             }
 
@@ -615,6 +654,18 @@ object NetworkDiagnosticEngine {
         )
     }
 
+    private fun probeTcpReachable(host: String, port: Int, timeoutMs: Int): Boolean {
+        val socket = Socket()
+        return try {
+            socket.connect(InetSocketAddress(host, port), timeoutMs)
+            true
+        } catch (_: Exception) {
+            false
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun probeHttp204(host: String, port: Int): NetworkDiagnosticCheck {
         val socket = Socket()
         return try {
@@ -626,18 +677,27 @@ object NetworkDiagnosticEngine {
                 "GET /generate_204 HTTP/1.0\r\nHost: $host\r\nConnection: close\r\n\r\n".toByteArray(Charsets.UTF_8)
             )
             socket.getOutputStream().flush()
-            val statusLine = BufferedReader(InputStreamReader(socket.getInputStream())).readLine()
+            val headers = VpsReachabilityTester.readHttpHeadersExact(socket.getInputStream())
+            val statusLine = headers?.lineSequence()?.firstOrNull()?.trim()
+            val statusCode = VpsReachabilityTester.parseHttpStatusCode(statusLine)
+            val location = VpsReachabilityTester.extractHeaderValue(headers, "Location")
             val ms = ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
-            if (statusLine != null && (statusLine.contains("204") || statusLine.contains("200") || statusLine.contains("30"))) {
-                NetworkDiagnosticCheck(
+            when {
+                statusCode == 204 || statusCode == 200 -> NetworkDiagnosticCheck(
                     id = "direct_http",
                     title = "Salida Internet HTTP 204",
                     detail = "$host respondió '$statusLine' en ${ms} ms.",
                     status = DiagnosticCheckStatus.PASS,
                     latencyMs = ms
                 )
-            } else {
-                NetworkDiagnosticCheck(
+                statusCode in 300..399 -> NetworkDiagnosticCheck(
+                    id = "direct_http",
+                    title = "Salida Internet HTTP 204",
+                    detail = "Portal cautivo / sin saldo: $host redirigió '$statusLine'${location?.let { " → Location=$it" } ?: ""} (${ms}ms). Operadora interceptando HTTP :80.",
+                    status = DiagnosticCheckStatus.FAIL,
+                    latencyMs = ms
+                )
+                else -> NetworkDiagnosticCheck(
                     id = "direct_http",
                     title = "Salida Internet HTTP 204",
                     detail = "$host devolvió respuesta inesperada: ${statusLine ?: "EOF"}",
@@ -700,6 +760,13 @@ object NetworkDiagnosticEngine {
         val warnCount = checks.count { it.status == DiagnosticCheckStatus.WARN }
 
         return when {
+            http?.detail?.contains("Portal cautivo", ignoreCase = true) == true &&
+                ssh?.status == DiagnosticCheckStatus.FAIL -> Triple(
+                DiagnosticCheckStatus.FAIL,
+                "Operadora móvil intercepta HTTP plano con 302 (portal cautivo/sin saldo) y bloquea puerto :22.",
+                "La línea móvil está redirigiendo :80/:$port con HTTP 302 y bloqueando :22. Prueba primero en Wi-Fi para validar tu VPS; en datos sin saldo necesitas activar el proxy WebSocket/HTTP CONNECT en el VPS o usar túnel SSL/TLS (:443 con SNI)."
+            )
+
             http?.status == DiagnosticCheckStatus.FAIL && dns?.status == DiagnosticCheckStatus.FAIL -> Triple(
                 DiagnosticCheckStatus.FAIL,
                 "Sin resolución DNS ni salida HTTP 204 en la ruta actual.",
@@ -708,8 +775,8 @@ object NetworkDiagnosticEngine {
 
             ssh?.status == DiagnosticCheckStatus.FAIL && proxy?.status != DiagnosticCheckStatus.PASS -> Triple(
                 DiagnosticCheckStatus.FAIL,
-                "Puerto $port sin proxy HTTP CONNECT y respaldo SSH ($host:22) con error.",
-                "El servidor SSH rechazó login o direct-tcpip, y el puerto $port no acepta HTTP CONNECT. Verifica usuario/clave o protocolo SSH :22 en tu perfil."
+                "Puerto $port sin proxy HTTP CONNECT y respaldo SSH ($host:22) inaccesible o con error.",
+                "Revisa arriba el detalle exacto de :22 y Location= del 302 en :$port. Prueba también en Wi-Fi para confirmar si el bloqueo es de tu operadora móvil o falta instalar el proxy en el VPS."
             )
 
             ssh?.status == DiagnosticCheckStatus.PASS && http?.status == DiagnosticCheckStatus.PASS -> Triple(

@@ -378,6 +378,55 @@ class JeffersVpnService : VpnService() {
                 }
             }
 
+            protocol == TunnelProtocol.SSL_TLS -> {
+                if (sshCandidateCredentials.isEmpty()) {
+                    return failAttempt("Falta contraseña SSH para túnel SSL/TLS en $cleanHost:${profile.port}")
+                }
+                VpnStateHolder.appendLog(
+                    "SSL",
+                    "Conectando túnel SSL/TLS + SNI (${profile.sniHost.ifBlank { cleanHost }}) en $cleanHost:${profile.port}…",
+                    LogLevel.INFO
+                )
+                val sslFactory = VpsReachabilityTester.createSslSshSocketFactory(
+                    profile = profile,
+                    protectSocket = ::protectSocketSafely,
+                    timeoutMs = 6000,
+                    onLog = VpnStateHolder::appendLog
+                )
+                val sslSsh = SshTunnelClient(
+                    protectSocket = ::protectSocketSafely,
+                    host = cleanHost,
+                    port = profile.port,
+                    username = sshUser,
+                    candidatePasswords = sshCandidatePasswords,
+                    customSocketFactory = sslFactory,
+                    candidateCredentials = sshCandidateCredentials
+                )
+                val conn = sslSsh.connect(6500)
+                if (conn.isFailure) {
+                    sslSsh.disconnect()
+                    val err = conn.exceptionOrNull()?.localizedMessage ?: "Error TLS/SSH"
+                    return failAttempt(
+                        userFacingError = "Fallo SSL/TLS→SSH en $cleanHost:${profile.port}: $err",
+                        logDetail = "Error SSL/TLS→SSH en $cleanHost:${profile.port}: $err"
+                    )
+                }
+                val fwd = sslSsh.verifyForwarding(4500)
+                if (fwd.isFailure) {
+                    val fwdErr = fwd.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
+                    sslSsh.disconnect()
+                    return failAttempt(
+                        userFacingError = "SSL/TLS autenticado pero sin salida a Internet: $fwdErr",
+                        logDetail = "SSL/TLS conectado pero direct-tcpip rechazado: $fwdErr"
+                    )
+                }
+                pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
+                establishedSshClient = sslSsh
+                activeSshClient = sslSsh
+                verifiedSshMode = "SSL_TLS"
+                verifiedChannelLabel = "SSL/TLS :${profile.port}→SSH"
+            }
+
             else -> {
                 // BHTTP or BHTTP_WS: test handshake & upgrade, then HTTP CONNECT proxy, then verified SSH :22
                 var bhttpStatusLine: String? = null
@@ -420,9 +469,11 @@ class JeffersVpnService : VpnService() {
                     if (bhttpStatusLine != null) {
                         initialRxBytes += bhttpHeaders!!.toByteArray(Charsets.UTF_8).size
                         val code = VpsReachabilityTester.parseHttpStatusCode(bhttpStatusLine)
+                        val loc = VpsReachabilityTester.extractHeaderValue(bhttpHeaders, "Location")
+                        val suffix = loc?.let { " → Location: $it" }.orEmpty()
                         VpnStateHolder.appendLog(
                             "BHTTP",
-                            "Respuesta servidor: $bhttpStatusLine",
+                            "Respuesta servidor: $bhttpStatusLine$suffix",
                             if (code == 101 || code in 200..299) LogLevel.SUCCESS else LogLevel.WARNING
                         )
                     } else {
@@ -713,6 +764,20 @@ class JeffersVpnService : VpnService() {
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
                         customSocketFactory = VpsReachabilityTester.createBhttpUpgradeSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5500,
+                            onLog = VpnStateHolder::appendLog
+                        ),
+                        candidateCredentials = sshCandidateCredentials
+                    )
+                    verifiedSshMode == "SSL_TLS" -> SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = profile.port,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = VpsReachabilityTester.createSslSshSocketFactory(
                             profile = profile,
                             protectSocket = ::protectSocketSafely,
                             timeoutMs = 5500,

@@ -1460,6 +1460,74 @@ class ExampleUnitTest {
             relayThread.join(1000)
         }
     }
+
+    @Test
+    fun `extractHeaderValue and probeHttpConnectProxy capture 302 redirect Location header`() {
+        val rawHeaders = "HTTP/1.1 302 Found\r\nServer: carrier-gw\r\nLocation: http://portal.tigo.sv/saldo\r\n\r\n"
+        assertEquals("http://portal.tigo.sv/saldo", com.example.vpn.VpsReachabilityTester.extractHeaderValue(rawHeaders, "location"))
+        assertEquals("carrier-gw", com.example.vpn.VpsReachabilityTester.extractHeaderValue(rawHeaders, "Server"))
+
+        val redirectServer = ServerSocket(0, 2, java.net.InetAddress.getByName("127.0.0.1"))
+        val port = redirectServer.localPort
+        val serverThread = thread(start = true) {
+            try {
+                val client = redirectServer.accept()
+                client.soTimeout = 2000
+                com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(client.getInputStream())
+                client.getOutputStream().write(rawHeaders.toByteArray(Charsets.UTF_8))
+                client.getOutputStream().flush()
+                client.close()
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            val outcome = com.example.vpn.VpsReachabilityTester.probeHttpConnectProxy(
+                host = "127.0.0.1",
+                port = port,
+                username = "root",
+                password = "secret",
+                protectSocket = { true },
+                timeoutMs = 2000,
+                sniHost = "m.tigo.com"
+            )
+            assertFalse(outcome.supported)
+            assertEquals("HTTP/1.1 302 Found", outcome.statusLine)
+            assertEquals("http://portal.tigo.sv/saldo", outcome.locationHeader)
+            assertTrue(outcome.errorDetail?.contains("http://portal.tigo.sv/saldo") == true)
+        } finally {
+            try { redirectServer.close() } catch (_: Exception) {}
+            serverThread.join(1000)
+        }
+    }
+
+    @Test
+    fun `summarizeDiagnosticChecks identifies carrier 302 captive portal separately from VPS failures`() {
+        val checks = listOf(
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "direct_http",
+                title = "Salida Internet HTTP 204",
+                detail = "Portal cautivo / sin saldo: connectivitycheck.gstatic.com redirigió 'HTTP/1.0 302 Moved Temporarily' → Location=http://portal.tigo.sv",
+                status = com.example.data.model.DiagnosticCheckStatus.FAIL
+            ),
+            com.example.data.model.NetworkDiagnosticCheck(
+                id = "ssh_tunnel",
+                title = "Túnel SSH (192.6.154.212:8080)",
+                detail = "Puerto :22 directo falló (Timeout en :22) y puente en :8080 rechazado",
+                status = com.example.data.model.DiagnosticCheckStatus.FAIL
+            )
+        )
+        val (status, summary, recommendation) = com.example.vpn.NetworkDiagnosticEngine.summarizeDiagnosticChecks(
+            checks = checks,
+            tunnelDiagnostics = com.example.data.model.TunnelDiagnosticsState(),
+            host = "192.6.154.212",
+            port = 8080
+        )
+        assertEquals(com.example.data.model.DiagnosticCheckStatus.FAIL, status)
+        assertTrue(summary.contains("portal cautivo/sin saldo", ignoreCase = true))
+        assertTrue(recommendation.contains("Wi-Fi", ignoreCase = true))
+        assertTrue(recommendation.contains("SSL/TLS", ignoreCase = true))
+    }
 }
 
 
