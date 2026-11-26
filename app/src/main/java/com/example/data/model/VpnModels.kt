@@ -106,6 +106,7 @@ enum class TunnelProtocol(val displayName: String, val badge: String) {
     BHTTP_WS(displayName = "BHTTP + WebSocket", badge = "BHTTP-WS"),
     HTTP_CONNECT(displayName = "HTTP CONNECT", badge = "HTTP"),
     SSL_TLS(displayName = "SSL/TLS + SNI (443)", badge = "SSL-443"),
+    SSL_PAYLOAD(displayName = "SSL + Payload/WS (443)", badge = "SSL-WS"),
     SSH_DIRECT(displayName = "SSH Directo (22)", badge = "SSH-22");
 
     companion object {

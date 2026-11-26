@@ -240,8 +240,8 @@ object VpsReachabilityTester {
             )
         }
 
-        // 2b. SSL/TLS + SNI mode (port 443 -> stunnel/TLS proxy to SSH)
-        if (protocol == TunnelProtocol.SSL_TLS) {
+        // 2b. SSL/TLS + SNI and SSL + Payload/WebSocket modes (port 443/8443 -> stunnel / WSS proxy to SSH)
+        if (protocol == TunnelProtocol.SSL_TLS || protocol == TunnelProtocol.SSL_PAYLOAD) {
             if (credentials.isEmpty()) {
                 return TunnelProbeOutcome(
                     isReachable = false,
@@ -251,14 +251,17 @@ object VpsReachabilityTester {
                     errorDetail = "Falta contraseña SSH para túnel SSL/TLS en $host:$port"
                 )
             }
-            return trySshOverSsl(
+            val sslOutcome = trySshOverSsl(
                 profile = profile,
                 user = user,
                 passwords = passwords,
                 credentials = credentials,
                 protectSocket = protectSocket,
-                timeoutMs = timeoutMs
+                timeoutMs = timeoutMs,
+                preferPayloadUpgrade = protocol == TunnelProtocol.SSL_PAYLOAD
             )
+            if (sslOutcome.isReachable) return sslOutcome
+            return sslOutcome
         }
 
         // 3. BHTTP / BHTTP_WS: test payload upgrade -> SSH, or HTTP CONNECT on port, or SSH :22
@@ -323,6 +326,7 @@ object VpsReachabilityTester {
         }
 
         // 3c. Check fallback SSH on port 22 with full forwarding verification
+        var ssh22Err: String? = null
         if (credentials.isNotEmpty()) {
             val ssh22 = SshTunnelClient(
                 protectSocket = protectSocket,
@@ -346,27 +350,37 @@ object VpsReachabilityTester {
                         errorDetail = null
                     )
                 }
-                val sshErr = conn.exceptionOrNull()?.localizedMessage ?: ssh22.lastErrorMessage ?: "Sin acceso SSH :22"
-                val portBanner = bhttpResult.statusLine ?: bhttpResult.errorDetail ?: "sin respuesta proxy"
-                return TunnelProbeOutcome(
-                    isReachable = false,
-                    latencyMs = null,
-                    channelLabel = null,
-                    httpBanner = bhttpResult.statusLine,
-                    errorDetail = "Puerto $port respondió '$portBanner' (no es túnel) y SSH :22 falló ($sshErr)"
-                )
+                ssh22Err = conn.exceptionOrNull()?.localizedMessage ?: ssh22.lastErrorMessage ?: "Sin acceso SSH :22"
             } finally {
                 ssh22.disconnect()
             }
         }
 
+        // 3d. Check fallback SSL/TLS + WS on port 443 when :port and :22 are unavailable
+        if (credentials.isNotEmpty() && port != 443) {
+            val sslOutcome = trySshOverSsl(
+                profile = profile,
+                user = user,
+                passwords = passwords,
+                credentials = credentials,
+                protectSocket = protectSocket,
+                timeoutMs = timeoutMs.coerceAtMost(4000),
+                overridePort = 443,
+                preferPayloadUpgrade = false
+            )
+            if (sslOutcome.isReachable) {
+                return sslOutcome
+            }
+        }
+
         val portBanner = bhttpResult.statusLine ?: bhttpResult.errorDetail ?: "sin túnel HTTP/WS"
+        val sshSuffix = ssh22Err?.let { " y SSH :22 falló ($it)" }.orEmpty()
         return TunnelProbeOutcome(
             isReachable = false,
             latencyMs = null,
             channelLabel = null,
             httpBanner = bhttpResult.statusLine,
-            errorDetail = "Puerto $port respondió '$portBanner' (no actúa como proxy ni WebSocket SSH)"
+            errorDetail = "Puerto $port respondió '$portBanner' (no es túnel)$sshSuffix"
         )
     }
 
@@ -512,64 +526,81 @@ object VpsReachabilityTester {
         }
     }
 
-    private fun trySshOverSsl(
+    internal fun trySshOverSsl(
         profile: VpnProfileEntity,
         user: String,
         passwords: List<String>,
         credentials: List<SshCredential>,
         protectSocket: (Socket) -> Boolean,
-        timeoutMs: Int
+        timeoutMs: Int,
+        overridePort: Int? = null,
+        preferPayloadUpgrade: Boolean = false
     ): TunnelProbeOutcome {
-        val factory = createSslSshSocketFactory(
-            profile = profile,
-            protectSocket = protectSocket,
-            timeoutMs = timeoutMs,
-            onLog = { _, _, _ -> }
-        )
-        val ssh = SshTunnelClient(
-            protectSocket = protectSocket,
-            host = profile.host.trim(),
-            port = profile.port,
-            username = user,
-            candidatePasswords = passwords,
-            customSocketFactory = factory,
-            onLog = { _, _, _ -> },
-            candidateCredentials = credentials
-        )
-        return try {
-            val conn = ssh.connect(timeoutMs)
-            if (conn.isFailure) {
-                val err = conn.exceptionOrNull()?.localizedMessage ?: "Error SSL/TLS→SSH"
-                return TunnelProbeOutcome(
-                    isReachable = false,
-                    latencyMs = null,
-                    channelLabel = null,
-                    httpBanner = null,
-                    errorDetail = "SSL/TLS :${profile.port} falló: $err"
+        val targetPort = overridePort ?: profile.port
+        val modes = if (preferPayloadUpgrade) listOf(true, false) else listOf(false, true)
+        var lastError: String? = null
+
+        for (usePayload in modes) {
+            val factory = if (usePayload) {
+                createSslPayloadSshSocketFactory(
+                    profile = profile,
+                    protectSocket = protectSocket,
+                    timeoutMs = timeoutMs,
+                    onLog = { _, _, _ -> },
+                    overridePort = targetPort
+                )
+            } else {
+                createSslSshSocketFactory(
+                    profile = profile,
+                    protectSocket = protectSocket,
+                    timeoutMs = timeoutMs,
+                    onLog = { _, _, _ -> },
+                    overridePort = targetPort
                 )
             }
-            val fwd = ssh.verifyForwarding(3500)
-            if (fwd.isFailure) {
-                val err = fwd.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
-                return TunnelProbeOutcome(
-                    isReachable = false,
-                    latencyMs = null,
-                    channelLabel = null,
-                    httpBanner = null,
-                    errorDetail = "SSL/TLS→SSH autenticado pero sin salida TCP: $err"
-                )
-            }
-            val rtt = conn.getOrNull() ?: fwd.getOrDefault(1)
-            TunnelProbeOutcome(
-                isReachable = true,
-                latencyMs = rtt,
-                channelLabel = "SSL/TLS :${profile.port}→SSH",
-                httpBanner = "TLS + SNI (${profile.sniHost.ifBlank { profile.host }}) verificado (${rtt} ms)",
-                errorDetail = null
+            val ssh = SshTunnelClient(
+                protectSocket = protectSocket,
+                host = profile.host.trim(),
+                port = targetPort,
+                username = user,
+                candidatePasswords = passwords,
+                customSocketFactory = factory,
+                onLog = { _, _, _ -> },
+                candidateCredentials = credentials
             )
-        } finally {
-            ssh.disconnect()
+            try {
+                val conn = ssh.connect(timeoutMs)
+                if (conn.isFailure) {
+                    lastError = conn.exceptionOrNull()?.localizedMessage ?: "Error SSL/TLS→SSH"
+                    continue
+                }
+                val fwd = ssh.verifyForwarding(3500)
+                if (fwd.isFailure) {
+                    lastError = fwd.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
+                    continue
+                }
+                val rtt = conn.getOrNull() ?: fwd.getOrDefault(1)
+                val label = if (usePayload) "SSL+WS :$targetPort→SSH" else "SSL/TLS :$targetPort→SSH"
+                val bannerPrefix = if (usePayload) "TLS + Payload/WS" else "TLS + SNI"
+                return TunnelProbeOutcome(
+                    isReachable = true,
+                    latencyMs = rtt,
+                    channelLabel = label,
+                    httpBanner = "$bannerPrefix (${profile.sniHost.ifBlank { profile.host }}) verificado (${rtt} ms)",
+                    errorDetail = null
+                )
+            } finally {
+                ssh.disconnect()
+            }
         }
+
+        return TunnelProbeOutcome(
+            isReachable = false,
+            latencyMs = null,
+            channelLabel = null,
+            httpBanner = null,
+            errorDetail = "SSL/TLS :$targetPort falló: ${lastError ?: "sin respuesta TLS/SSH"}"
+        )
     }
 
     @android.annotation.SuppressLint("CustomX509TrustManager", "TrustAllX509TrustManager")
@@ -584,59 +615,107 @@ object VpsReachabilityTester {
         }.socketFactory
     }
 
+    private fun openSslSocket(
+        profile: VpnProfileEntity,
+        protectSocket: (Socket) -> Boolean,
+        timeoutMs: Int,
+        overridePort: Int?,
+        onLog: (String, String, LogLevel) -> Unit
+    ): javax.net.ssl.SSLSocket {
+        val targetHost = profile.host.trim()
+        val targetPort = overridePort ?: profile.port
+        val sni = profile.sniHost.trim().ifBlank { targetHost }
+
+        for (allowSelfSigned in listOf(false, true)) {
+            val raw = Socket()
+            var sslSocket: javax.net.ssl.SSLSocket? = null
+            try {
+                bindSocketIfNeeded(raw)
+                if (!protectSocket(raw)) {
+                    try { raw.close() } catch (_: Exception) {}
+                    throw IOException("No se pudo proteger socket SSL/TLS")
+                }
+                raw.tcpNoDelay = true
+                raw.keepAlive = true
+                raw.connect(InetSocketAddress(targetHost, targetPort), timeoutMs)
+                raw.soTimeout = timeoutMs
+
+                val sslFactory = if (allowSelfSigned) {
+                    createStunnelCompatibleSslFactory()
+                } else {
+                    javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+                }
+                sslSocket = sslFactory.createSocket(raw, sni, targetPort, true) as javax.net.ssl.SSLSocket
+                if (sni.isNotBlank() && !isIpAddressLiteral(sni)) {
+                    val params = sslSocket.sslParameters
+                    params.serverNames = listOf(javax.net.ssl.SNIHostName(sni))
+                    sslSocket.sslParameters = params
+                }
+                sslSocket.startHandshake()
+                sslSocket.soTimeout = 30_000
+                onLog("SSL", "Handshake TLS completado en $targetHost:$targetPort (SNI=$sni)", LogLevel.INFO)
+                return sslSocket
+            } catch (e: javax.net.ssl.SSLHandshakeException) {
+                try { sslSocket?.close() } catch (_: Exception) {}
+                try { raw.close() } catch (_: Exception) {}
+                if (allowSelfSigned) {
+                    throw IOException("TLS/SNI falló en $targetHost:$targetPort ($sni): ${e.localizedMessage ?: e.javaClass.simpleName}", e)
+                }
+            } catch (e: Exception) {
+                try { sslSocket?.close() } catch (_: Exception) {}
+                try { raw.close() } catch (_: Exception) {}
+                throw IOException("TLS/SNI falló en $targetHost:$targetPort ($sni): ${e.localizedMessage ?: e.javaClass.simpleName}", e)
+            }
+        }
+        throw IOException("TLS/SNI no disponible en $targetHost:$targetPort")
+    }
+
     fun createSslSshSocketFactory(
         profile: VpnProfileEntity,
         protectSocket: (Socket) -> Boolean,
         timeoutMs: Int,
-        onLog: (String, String, LogLevel) -> Unit
+        onLog: (String, String, LogLevel) -> Unit,
+        overridePort: Int? = null
+    ): SocketFactory = object : SocketFactory {
+        override fun createSocket(host: String, port: Int): Socket =
+            openSslSocket(profile, protectSocket, timeoutMs, overridePort, onLog)
+
+        override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
+        override fun getOutputStream(socket: Socket): OutputStream = socket.getOutputStream()
+    }
+
+    fun createSslPayloadSshSocketFactory(
+        profile: VpnProfileEntity,
+        protectSocket: (Socket) -> Boolean,
+        timeoutMs: Int,
+        onLog: (String, String, LogLevel) -> Unit,
+        overridePort: Int? = null
     ): SocketFactory = object : SocketFactory {
         override fun createSocket(host: String, port: Int): Socket {
-            val targetHost = profile.host.trim()
-            val targetPort = profile.port
-            val sni = profile.sniHost.trim().ifBlank { targetHost }
+            val sslSocket = openSslSocket(profile, protectSocket, timeoutMs, overridePort, onLog)
+            try {
+                sslSocket.soTimeout = timeoutMs
+                val payload = BhttpPayloadBuilder.compile(profile).toByteArray(Charsets.UTF_8)
+                sslSocket.outputStream.write(payload)
+                sslSocket.outputStream.flush()
 
-            for (allowSelfSigned in listOf(false, true)) {
-                val raw = Socket()
-                var sslSocket: javax.net.ssl.SSLSocket? = null
-                try {
-                    bindSocketIfNeeded(raw)
-                    if (!protectSocket(raw)) {
-                        try { raw.close() } catch (_: Exception) {}
-                        throw IOException("No se pudo proteger socket SSL/TLS")
-                    }
-                    raw.tcpNoDelay = true
-                    raw.keepAlive = true
-                    raw.connect(InetSocketAddress(targetHost, targetPort), timeoutMs)
-                    raw.soTimeout = timeoutMs
-
-                    val sslFactory = if (allowSelfSigned) {
-                        createStunnelCompatibleSslFactory()
-                    } else {
-                        javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
-                    }
-                    sslSocket = sslFactory.createSocket(raw, sni, targetPort, true) as javax.net.ssl.SSLSocket
-                    if (sni.isNotBlank() && !isIpAddressLiteral(sni)) {
-                        val params = sslSocket.sslParameters
-                        params.serverNames = listOf(javax.net.ssl.SNIHostName(sni))
-                        sslSocket.sslParameters = params
-                    }
-                    sslSocket.startHandshake()
-                    sslSocket.soTimeout = 30_000
-                    onLog("SSL", "Handshake TLS completado en $targetHost:$targetPort (SNI=$sni)", LogLevel.INFO)
-                    return sslSocket
-                } catch (e: javax.net.ssl.SSLHandshakeException) {
-                    try { sslSocket?.close() } catch (_: Exception) {}
-                    try { raw.close() } catch (_: Exception) {}
-                    if (allowSelfSigned) {
-                        throw IOException("TLS/SNI falló en $targetHost:$targetPort ($sni): ${e.localizedMessage ?: e.javaClass.simpleName}", e)
-                    }
-                } catch (e: Exception) {
-                    try { sslSocket?.close() } catch (_: Exception) {}
-                    try { raw.close() } catch (_: Exception) {}
-                    throw IOException("TLS/SNI falló en $targetHost:$targetPort ($sni): ${e.localizedMessage ?: e.javaClass.simpleName}", e)
+                val headers = readHttpHeadersExact(sslSocket.inputStream)
+                val statusLine = headers?.lineSequence()?.firstOrNull()?.trim()
+                val code = parseHttpStatusCode(statusLine)
+                if (code != 101 && code !in 200..299) {
+                    try { sslSocket.close() } catch (_: Exception) {}
+                    throw IOException("Upgrade SSL+Payload/WS rechazado: ${statusLine ?: "EOF"}")
                 }
+                sslSocket.soTimeout = 30_000
+                onLog("SSL-WS", "Canal SSH sobre SSL+Payload ('$statusLine') establecido", LogLevel.INFO)
+                return sslSocket
+            } catch (e: IOException) {
+                try { sslSocket.close() } catch (_: Exception) {}
+                throw e
+            } catch (e: Exception) {
+                try { sslSocket.close() } catch (_: Exception) {}
+                throw IOException("Error en SSL+Payload/WS: ${e.localizedMessage ?: e.javaClass.simpleName}", e)
             }
-            throw IOException("TLS/SNI no disponible en $targetHost:$targetPort")
         }
 
         override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()

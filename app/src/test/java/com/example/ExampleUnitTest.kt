@@ -1528,8 +1528,154 @@ class ExampleUnitTest {
         assertTrue(recommendation.contains("Wi-Fi", ignoreCase = true))
         assertTrue(recommendation.contains("SSL/TLS", ignoreCase = true))
     }
+
+    @Test
+    fun `tunnelProtocol includes SSL_TLS and SSL_PAYLOAD alongside HTTP CONNECT and SSH_DIRECT`() {
+        val names = com.example.data.model.TunnelProtocol.entries.map { it.name }.toSet()
+        assertTrue(names.containsAll(setOf("BHTTP", "BHTTP_WS", "HTTP_CONNECT", "SSL_TLS", "SSL_PAYLOAD", "SSH_DIRECT")))
+        assertEquals(
+            com.example.data.model.TunnelProtocol.SSL_PAYLOAD,
+            com.example.data.model.TunnelProtocol.fromName("SSL_PAYLOAD")
+        )
+        assertEquals(
+            com.example.data.model.TunnelProtocol.SSL_TLS,
+            com.example.data.model.TunnelProtocol.fromName("SSL_TLS")
+        )
+    }
+
+    @Test
+    fun `sshTunnelClient short-circuits retries when pre-auth transport or proxy fails`() {
+        val createCalls = java.util.concurrent.atomic.AtomicInteger(0)
+        val failingFactory = object : com.jcraft.jsch.SocketFactory {
+            override fun createSocket(host: String, port: Int): java.net.Socket {
+                createCalls.incrementAndGet()
+                throw java.io.IOException("HTTP CONNECT hacia SSH :22 rechazado en 127.0.0.1:8080 (HTTP/1.1 302 Found)")
+            }
+
+            override fun getInputStream(socket: java.net.Socket) = socket.getInputStream()
+            override fun getOutputStream(socket: java.net.Socket) = socket.getOutputStream()
+        }
+
+        val client = com.example.vpn.SshTunnelClient(
+            protectSocket = { true },
+            host = "127.0.0.1",
+            port = 8080,
+            username = "root",
+            candidatePasswords = listOf("pass1", "pass2"),
+            customSocketFactory = failingFactory,
+            onLog = { _, _, _ -> },
+            candidateCredentials = listOf(
+                com.example.vpn.SshCredential("root", "pass1"),
+                com.example.vpn.SshCredential("admin", "pass2")
+            )
+        )
+
+        val result = client.connect(timeoutMs = 2000)
+        assertTrue(result.isFailure)
+        assertEquals(
+            "Pre-auth transport rejection must stop credential retry loop on first attempt",
+            1,
+            createCalls.get()
+        )
+    }
+
+    @Test
+    fun `createSslPayloadSshSocketFactory completes TLS handshake sends WS upgrade and reads SSH banner`() {
+        val keystoreFile = java.nio.file.Files.createTempFile("jeffers-ssl-test", ".p12").toFile()
+        keystoreFile.delete()
+        val keytoolExec = java.io.File(System.getProperty("java.home"), "bin/keytool")
+            .takeIf { it.exists() }?.absolutePath ?: "keytool"
+        val pass = "changeit"
+        val genProc = ProcessBuilder(
+            keytoolExec, "-genkeypair",
+            "-alias", "test",
+            "-keyalg", "RSA",
+            "-keysize", "2048",
+            "-validity", "1",
+            "-storetype", "PKCS12",
+            "-keystore", keystoreFile.absolutePath,
+            "-storepass", pass,
+            "-keypass", pass,
+            "-dname", "CN=localhost"
+        ).redirectErrorStream(true).start()
+        val genExit = genProc.waitFor()
+        assertEquals("keytool must create ephemeral PKCS12 keystore cleanly", 0, genExit)
+
+        val ks = java.security.KeyStore.getInstance("PKCS12")
+        keystoreFile.inputStream().use { ks.load(it, pass.toCharArray()) }
+        val kmf = javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm())
+        kmf.init(ks, pass.toCharArray())
+        val sslCtx = javax.net.ssl.SSLContext.getInstance("TLS")
+        sslCtx.init(kmf.keyManagers, null, java.security.SecureRandom())
+
+        val sslServer = sslCtx.serverSocketFactory.createServerSocket(
+            0, 5, java.net.InetAddress.getByName("127.0.0.1")
+        ) as javax.net.ssl.SSLServerSocket
+        val tlsPort = sslServer.localPort
+        val receivedUpgradeHeader = java.util.concurrent.atomic.AtomicReference("")
+
+        val serverThread = thread(start = true) {
+            try {
+                while (!sslServer.isClosed) {
+                    val client = sslServer.accept() as javax.net.ssl.SSLSocket
+                    thread(start = true) {
+                        try {
+                            client.soTimeout = 3000
+                            client.startHandshake()
+                            val hdr = com.example.vpn.VpsReachabilityTester.readHttpHeadersExact(client.inputStream).orEmpty()
+                            receivedUpgradeHeader.set(hdr)
+                            if (hdr.contains("upgrade: websocket", ignoreCase = true)) {
+                                client.outputStream.write(
+                                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                                        .toByteArray(Charsets.UTF_8)
+                                )
+                                client.outputStream.write("SSH-2.0-OpenSSH_9.2p1\r\n".toByteArray(Charsets.UTF_8))
+                                client.outputStream.flush()
+                            }
+                        } catch (_: Exception) {
+                        } finally {
+                            try { client.close() } catch (_: Exception) {}
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+
+        try {
+            val profile = com.example.data.local.VpnProfileEntity(
+                id = 701L,
+                profileName = "SSL WS Test",
+                vpsName = "VPS SSL",
+                host = "127.0.0.1",
+                port = 443,
+                username = "root",
+                password = "secret",
+                carrier = com.example.data.model.CarrierType.TIGO.name,
+                protocol = com.example.data.model.TunnelProtocol.SSL_PAYLOAD.name,
+                sniHost = "m.tigo.com",
+                bhttpPayload = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
+            )
+
+            val factory = com.example.vpn.VpsReachabilityTester.createSslPayloadSshSocketFactory(
+                profile = profile,
+                protectSocket = { sock -> sock.isBound },
+                timeoutMs = 3000,
+                onLog = { _, _, _ -> },
+                overridePort = tlsPort
+            )
+            val tunnelSock = factory.createSocket("127.0.0.1", tlsPort)
+            try {
+                val sshBanner = tunnelSock.getInputStream().bufferedReader().readLine()
+                assertEquals("SSH-2.0-OpenSSH_9.2p1", sshBanner)
+                assertTrue(receivedUpgradeHeader.get().contains("Upgrade: websocket", ignoreCase = true))
+            } finally {
+                tunnelSock.close()
+            }
+        } finally {
+            try { sslServer.close() } catch (_: Exception) {}
+            serverThread.join(1500)
+            keystoreFile.delete()
+        }
+    }
 }
-
-
-
-

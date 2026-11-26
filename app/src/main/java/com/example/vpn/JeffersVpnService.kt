@@ -259,6 +259,69 @@ class JeffersVpnService : VpnService() {
         var verifiedProxyConnect = false
         var verifiedChannelLabel = protocol.badge
         var verifiedSshMode = "DIRECT"
+        var verifiedSshPort = profile.port
+
+        fun tryConnectSslVariant(targetPort: Int, usePayloadUpgrade: Boolean): Pair<SshTunnelClient, Int>? {
+            if (sshCandidateCredentials.isEmpty()) return null
+            val factory = if (usePayloadUpgrade) {
+                VpsReachabilityTester.createSslPayloadSshSocketFactory(
+                    profile = profile,
+                    protectSocket = ::protectSocketSafely,
+                    timeoutMs = 5500,
+                    onLog = VpnStateHolder::appendLog,
+                    overridePort = targetPort
+                )
+            } else {
+                VpsReachabilityTester.createSslSshSocketFactory(
+                    profile = profile,
+                    protectSocket = ::protectSocketSafely,
+                    timeoutMs = 5500,
+                    onLog = VpnStateHolder::appendLog,
+                    overridePort = targetPort
+                )
+            }
+            val candidate = SshTunnelClient(
+                protectSocket = ::protectSocketSafely,
+                host = cleanHost,
+                port = targetPort,
+                username = sshUser,
+                candidatePasswords = sshCandidatePasswords,
+                customSocketFactory = factory,
+                candidateCredentials = sshCandidateCredentials
+            )
+            val conn = candidate.connect(6000)
+            if (conn.isSuccess && candidate.verifyForwarding(4500).isSuccess) {
+                return candidate to (conn.getOrNull() ?: 1)
+            }
+            candidate.disconnect()
+            return null
+        }
+
+        fun tryConnectSshDirect(targetPort: Int): Pair<SshTunnelClient?, String?> {
+            if (sshCandidateCredentials.isEmpty()) return null to "Sin credenciales SSH"
+            val sshClient = SshTunnelClient(
+                protectSocket = ::protectSocketSafely,
+                host = cleanHost,
+                port = targetPort,
+                username = sshUser,
+                candidatePasswords = sshCandidatePasswords,
+                candidateCredentials = sshCandidateCredentials
+            )
+            val conn = sshClient.connect(5500)
+            if (conn.isFailure) {
+                val err = conn.exceptionOrNull()?.localizedMessage ?: sshClient.lastErrorMessage ?: "Sin respuesta en :$targetPort"
+                sshClient.disconnect()
+                return null to err
+            }
+            val fwd = sshClient.verifyForwarding(4000)
+            if (fwd.isFailure) {
+                val err = fwd.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
+                sshClient.disconnect()
+                return null to err
+            }
+            pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
+            return sshClient to null
+        }
 
         when {
             protocol == TunnelProtocol.SSH_DIRECT || profile.port == 22 -> {
@@ -267,37 +330,39 @@ class JeffersVpnService : VpnService() {
                     "Conectando sesión SSH ($sshUser@$cleanHost:${profile.port})…",
                     LogLevel.INFO
                 )
-                val sshClient = SshTunnelClient(
-                    protectSocket = ::protectSocketSafely,
-                    host = cleanHost,
-                    port = profile.port,
-                    username = sshUser,
-                    candidatePasswords = sshCandidatePasswords,
-                    candidateCredentials = sshCandidateCredentials
-                )
-                val connectResult = sshClient.connect(6000)
-                if (connectResult.isFailure) {
-                    sshClient.disconnect()
-                    val err = connectResult.exceptionOrNull()
-                    val errorDetail = err?.localizedMessage ?: err?.javaClass?.simpleName ?: "Error SSH"
-                    return failAttempt(
-                        userFacingError = "Fallo SSH en $cleanHost:${profile.port}: $errorDetail",
-                        logDetail = "Error autenticando SSH en $cleanHost:${profile.port}: $errorDetail"
+                val (sshClient, sshErr) = tryConnectSshDirect(profile.port)
+                if (sshClient != null) {
+                    establishedSshClient = sshClient
+                    activeSshClient = sshClient
+                    verifiedSshMode = "DIRECT"
+                    verifiedSshPort = profile.port
+                    verifiedChannelLabel = "SSH :${profile.port}"
+                } else {
+                    // Cascade to SSL/TLS :443 if direct SSH port is blocked
+                    VpnStateHolder.appendLog(
+                        "SSL",
+                        "SSH :${profile.port} no disponible ($sshErr); probando respaldo SSL/TLS :443…",
+                        LogLevel.WARNING
                     )
+                    val sslDirect = tryConnectSslVariant(443, false)
+                    val sslPayload = if (sslDirect == null) tryConnectSslVariant(443, true) else null
+                    val sslFallback = sslDirect ?: sslPayload
+                    if (sslFallback != null) {
+                        val (client, rtt) = sslFallback
+                        val isPayloadMode = sslDirect == null
+                        pingMs = rtt
+                        establishedSshClient = client
+                        activeSshClient = client
+                        verifiedSshPort = 443
+                        verifiedSshMode = if (isPayloadMode) "SSL_PAYLOAD" else "SSL_TLS"
+                        verifiedChannelLabel = if (isPayloadMode) "SSL+WS :443→SSH" else "SSL/TLS :443→SSH"
+                    } else {
+                        return failAttempt(
+                            userFacingError = "Fallo SSH en $cleanHost:${profile.port}: ${sshErr ?: "sin conexión"}",
+                            logDetail = "Error SSH en $cleanHost:${profile.port} ($sshErr) y respaldo SSL :443 no disponible"
+                        )
+                    }
                 }
-                val fwdResult = sshClient.verifyForwarding(4500)
-                if (fwdResult.isFailure) {
-                    val fwdErr = fwdResult.exceptionOrNull()?.localizedMessage ?: "Sin reenvío TCP"
-                    sshClient.disconnect()
-                    return failAttempt(
-                        userFacingError = "SSH autenticado pero sin salida a Internet: $fwdErr",
-                        logDetail = "SSH conectado en $cleanHost:${profile.port} pero direct-tcpip rechazado: $fwdErr"
-                    )
-                }
-                pingMs = connectResult.getOrNull() ?: fwdResult.getOrDefault(1)
-                establishedSshClient = sshClient
-                activeSshClient = sshClient
-                verifiedChannelLabel = "SSH :${profile.port}"
             }
 
             protocol == TunnelProtocol.HTTP_CONNECT -> {
@@ -324,107 +389,131 @@ class JeffersVpnService : VpnService() {
                         "Proxy HTTP CONNECT verificado ✓ (${proxyCheck.statusLine ?: "200 OK"} • ${pingMs} ms)",
                         LogLevel.SUCCESS
                     )
-                } else if (sshCandidatePasswords.isNotEmpty()) {
-                    VpnStateHolder.appendLog(
-                        "PROXY",
-                        "Proxy directo no disponible (${proxyCheck.errorDetail ?: proxyCheck.statusLine ?: "sin 200"}); probando HTTP CONNECT→SSH (127.0.0.1:22)…",
-                        LogLevel.INFO
-                    )
-                    val connectFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
-                        profile = profile,
-                        protectSocket = ::protectSocketSafely,
-                        timeoutMs = 5500,
-                        onLog = VpnStateHolder::appendLog
-                    )
-                    val sshViaProxy = SshTunnelClient(
-                        protectSocket = ::protectSocketSafely,
-                        host = cleanHost,
-                        port = profile.port,
-                        username = sshUser,
-                        candidatePasswords = sshCandidatePasswords,
-                        customSocketFactory = connectFactory,
-                        candidateCredentials = sshCandidateCredentials
-                    )
-                    val conn = sshViaProxy.connect(6000)
-                    val fwd = if (conn.isSuccess) sshViaProxy.verifyForwarding(4500) else Result.failure(
-                        conn.exceptionOrNull() ?: java.io.IOException("Error SSH sobre HTTP CONNECT")
-                    )
-                    if (conn.isSuccess && fwd.isSuccess) {
-                        pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
-                        establishedSshClient = sshViaProxy
-                        activeSshClient = sshViaProxy
-                        verifiedSshMode = "HTTP_CONNECT"
-                        verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
+                } else {
+                    if (sshCandidatePasswords.isNotEmpty()) {
                         VpnStateHolder.appendLog(
                             "PROXY",
-                            "Túnel HTTP CONNECT→SSH verificado ✓ (${pingMs} ms)",
-                            LogLevel.SUCCESS
+                            "Proxy directo no disponible (${proxyCheck.errorDetail ?: proxyCheck.statusLine ?: "sin 200"}); probando HTTP CONNECT→SSH…",
+                            LogLevel.INFO
                         )
-                    } else {
-                        sshViaProxy.disconnect()
-                        val sshErr = fwd.exceptionOrNull()?.localizedMessage ?: sshViaProxy.lastErrorMessage
+                        val connectFactory = VpsReachabilityTester.createHttpConnectSshSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5500,
+                            onLog = VpnStateHolder::appendLog
+                        )
+                        val sshViaProxy = SshTunnelClient(
+                            protectSocket = ::protectSocketSafely,
+                            host = cleanHost,
+                            port = profile.port,
+                            username = sshUser,
+                            candidatePasswords = sshCandidatePasswords,
+                            customSocketFactory = connectFactory,
+                            candidateCredentials = sshCandidateCredentials
+                        )
+                        val conn = sshViaProxy.connect(6000)
+                        val fwd = if (conn.isSuccess) sshViaProxy.verifyForwarding(4500) else Result.failure(
+                            conn.exceptionOrNull() ?: java.io.IOException("Error SSH sobre HTTP CONNECT")
+                        )
+                        if (conn.isSuccess && fwd.isSuccess) {
+                            pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
+                            establishedSshClient = sshViaProxy
+                            activeSshClient = sshViaProxy
+                            verifiedSshMode = "HTTP_CONNECT"
+                            verifiedSshPort = profile.port
+                            verifiedChannelLabel = "HTTP CONNECT→SSH :${profile.port}"
+                            VpnStateHolder.appendLog(
+                                "PROXY",
+                                "Túnel HTTP CONNECT→SSH verificado ✓ (${pingMs} ms)",
+                                LogLevel.SUCCESS
+                            )
+                        } else {
+                            sshViaProxy.disconnect()
+                        }
+                    }
+
+                    // Fallback cascade: SSL/TLS (:443/:8443) -> Direct SSH (:22)
+                    if (establishedSshClient == null) {
+                        val sslPort = if (profile.port == 8443) 8443 else 443
+                        val sslDirect = tryConnectSslVariant(sslPort, false)
+                        val sslPayload = if (sslDirect == null) tryConnectSslVariant(sslPort, true) else null
+                        val sslRes = sslDirect ?: sslPayload
+                        if (sslRes != null) {
+                            val isPayloadMode = sslDirect == null
+                            pingMs = sslRes.second
+                            establishedSshClient = sslRes.first
+                            activeSshClient = sslRes.first
+                            verifiedSshPort = sslPort
+                            verifiedSshMode = if (isPayloadMode) "SSL_PAYLOAD" else "SSL_TLS"
+                            verifiedChannelLabel = if (isPayloadMode) "SSL+WS :$sslPort→SSH" else "SSL/TLS :$sslPort→SSH"
+                        } else {
+                            val (ssh22, _) = tryConnectSshDirect(22)
+                            if (ssh22 != null) {
+                                establishedSshClient = ssh22
+                                activeSshClient = ssh22
+                                verifiedSshPort = 22
+                                verifiedSshMode = "DIRECT"
+                                verifiedChannelLabel = "SSH :22 (respaldo)"
+                            }
+                        }
+                    }
+
+                    if (establishedSshClient == null) {
                         val reason = proxyCheck.errorDetail ?: "Puerto ${profile.port} no actúa como proxy HTTP CONNECT"
                         return failAttempt(
-                            userFacingError = if (sshErr != null) "$reason • $sshErr" else reason,
-                            logDetail = "HTTP CONNECT y HTTP CONNECT→SSH fallaron en $cleanHost:${profile.port}: $reason | $sshErr"
+                            userFacingError = reason,
+                            logDetail = "HTTP CONNECT, SSL :443 y SSH :22 fallaron en $cleanHost:${profile.port}: $reason"
                         )
                     }
-                } else {
-                    val reason = proxyCheck.errorDetail ?: "Puerto ${profile.port} no actúa como proxy HTTP CONNECT"
-                    return failAttempt(
-                        userFacingError = reason,
-                        logDetail = "HTTP CONNECT falló en $cleanHost:${profile.port}: $reason"
-                    )
                 }
             }
 
-            protocol == TunnelProtocol.SSL_TLS -> {
+            protocol == TunnelProtocol.SSL_TLS || protocol == TunnelProtocol.SSL_PAYLOAD -> {
                 if (sshCandidateCredentials.isEmpty()) {
                     return failAttempt("Falta contraseña SSH para túnel SSL/TLS en $cleanHost:${profile.port}")
                 }
+                val preferPayload = protocol == TunnelProtocol.SSL_PAYLOAD
+                val sslPorts = listOf(profile.port, 443, 8443).distinct()
                 VpnStateHolder.appendLog(
                     "SSL",
-                    "Conectando túnel SSL/TLS + SNI (${profile.sniHost.ifBlank { cleanHost }}) en $cleanHost:${profile.port}…",
+                    "Conectando túnel ${protocol.badge} + SNI (${profile.sniHost.ifBlank { cleanHost }}) en $cleanHost:${sslPorts.first()}…",
                     LogLevel.INFO
                 )
-                val sslFactory = VpsReachabilityTester.createSslSshSocketFactory(
-                    profile = profile,
-                    protectSocket = ::protectSocketSafely,
-                    timeoutMs = 6000,
-                    onLog = VpnStateHolder::appendLog
-                )
-                val sslSsh = SshTunnelClient(
-                    protectSocket = ::protectSocketSafely,
-                    host = cleanHost,
-                    port = profile.port,
-                    username = sshUser,
-                    candidatePasswords = sshCandidatePasswords,
-                    customSocketFactory = sslFactory,
-                    candidateCredentials = sshCandidateCredentials
-                )
-                val conn = sslSsh.connect(6500)
-                if (conn.isFailure) {
-                    sslSsh.disconnect()
-                    val err = conn.exceptionOrNull()?.localizedMessage ?: "Error TLS/SSH"
-                    return failAttempt(
-                        userFacingError = "Fallo SSL/TLS→SSH en $cleanHost:${profile.port}: $err",
-                        logDetail = "Error SSL/TLS→SSH en $cleanHost:${profile.port}: $err"
-                    )
+
+                var matchedMode = if (preferPayload) "SSL_PAYLOAD" else "SSL_TLS"
+                for (candidatePort in sslPorts) {
+                    val modes = if (preferPayload) listOf(true, false) else listOf(false, true)
+                    for (usePayload in modes) {
+                        val res = tryConnectSslVariant(candidatePort, usePayload)
+                        if (res != null) {
+                            pingMs = res.second
+                            establishedSshClient = res.first
+                            activeSshClient = res.first
+                            verifiedSshPort = candidatePort
+                            matchedMode = if (usePayload) "SSL_PAYLOAD" else "SSL_TLS"
+                            verifiedSshMode = matchedMode
+                            verifiedChannelLabel = if (usePayload) "SSL+WS :$candidatePort→SSH" else "SSL/TLS :$candidatePort→SSH"
+                            break
+                        }
+                    }
+                    if (establishedSshClient != null) break
                 }
-                val fwd = sslSsh.verifyForwarding(4500)
-                if (fwd.isFailure) {
-                    val fwdErr = fwd.exceptionOrNull()?.localizedMessage ?: "direct-tcpip rechazado"
-                    sslSsh.disconnect()
-                    return failAttempt(
-                        userFacingError = "SSL/TLS autenticado pero sin salida a Internet: $fwdErr",
-                        logDetail = "SSL/TLS conectado pero direct-tcpip rechazado: $fwdErr"
-                    )
+
+                if (establishedSshClient == null) {
+                    val (ssh22, sshErr) = tryConnectSshDirect(22)
+                    if (ssh22 != null) {
+                        establishedSshClient = ssh22
+                        activeSshClient = ssh22
+                        verifiedSshPort = 22
+                        verifiedSshMode = "DIRECT"
+                        verifiedChannelLabel = "SSH :22 (respaldo)"
+                    } else {
+                        return failAttempt(
+                            userFacingError = "Fallo ${protocol.badge} en $cleanHost:${profile.port} y SSH :22 ($sshErr)",
+                            logDetail = "Error ${protocol.badge}→SSH en $cleanHost:${profile.port} (SNI=${profile.sniHost}) | SSH :22: $sshErr"
+                        )
+                    }
                 }
-                pingMs = conn.getOrNull() ?: fwd.getOrDefault(1)
-                establishedSshClient = sslSsh
-                activeSshClient = sslSsh
-                verifiedSshMode = "SSL_TLS"
-                verifiedChannelLabel = "SSL/TLS :${profile.port}→SSH"
             }
 
             else -> {
@@ -616,6 +705,7 @@ class JeffersVpnService : VpnService() {
                             pingMs = conn22.getOrNull() ?: pingMs
                             establishedSshClient = ssh22
                             activeSshClient = ssh22
+                            verifiedSshPort = 22
                             verifiedSshMode = "DIRECT"
                             verifiedChannelLabel = "SSH :22 (respaldo)"
                         } else {
@@ -628,6 +718,35 @@ class JeffersVpnService : VpnService() {
                     }
                 }
 
+                // Step C2: Cascade to SSL/TLS (:443) and SSL+WS (:443 / :8443) when carrier blocks HTTP/:22
+                if (establishedSshClient == null && !verifiedProxyConnect && sshCandidateCredentials.isNotEmpty()) {
+                    VpnStateHolder.appendLog(
+                        "SSL",
+                        "Probando respaldo automático SSL/TLS y SSL+WS (:443/:8443) en $cleanHost…",
+                        LogLevel.INFO
+                    )
+                    for (sslCandidatePort in listOf(443, 8443)) {
+                        val sslDirect = tryConnectSslVariant(sslCandidatePort, false)
+                        val sslPayload = if (sslDirect == null) tryConnectSslVariant(sslCandidatePort, true) else null
+                        val matched = sslDirect ?: sslPayload
+                        if (matched != null) {
+                            val isPayloadMode = sslDirect == null
+                            pingMs = matched.second
+                            establishedSshClient = matched.first
+                            activeSshClient = matched.first
+                            verifiedSshPort = sslCandidatePort
+                            verifiedSshMode = if (isPayloadMode) "SSL_PAYLOAD" else "SSL_TLS"
+                            verifiedChannelLabel = if (isPayloadMode) "SSL+WS :$sslCandidatePort→SSH" else "SSL/TLS :$sslCandidatePort→SSH"
+                            VpnStateHolder.appendLog(
+                                "SSL",
+                                "Respaldo $verifiedChannelLabel verificado ✓ (${pingMs} ms)",
+                                LogLevel.SUCCESS
+                            )
+                            break
+                        }
+                    }
+                }
+
                 // Step D: Strict guarantee — NEVER declare CONNECTED without a real verified tunnel!
                 if (establishedSshClient == null && !verifiedProxyConnect) {
                     val portReason = when {
@@ -637,7 +756,7 @@ class JeffersVpnService : VpnService() {
                     }
                     val sshReason = sshFallbackErr ?: "Sin canal SSH"
                     return failAttempt(
-                        userFacingError = "$portReason • SSH :22 falló: $sshReason",
+                        userFacingError = "$portReason • SSH :22 / SSL :443 fallaron: $sshReason",
                         logDetail = "CONEXIÓN RECHAZADA (sin túnel real): $portReason | SSH :22: $sshReason"
                     )
                 }
@@ -774,21 +893,37 @@ class JeffersVpnService : VpnService() {
                     verifiedSshMode == "SSL_TLS" -> SshTunnelClient(
                         protectSocket = ::protectSocketSafely,
                         host = cleanHost,
-                        port = profile.port,
+                        port = verifiedSshPort,
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
                         customSocketFactory = VpsReachabilityTester.createSslSshSocketFactory(
                             profile = profile,
                             protectSocket = ::protectSocketSafely,
                             timeoutMs = 5500,
-                            onLog = VpnStateHolder::appendLog
+                            onLog = VpnStateHolder::appendLog,
+                            overridePort = verifiedSshPort
+                        ),
+                        candidateCredentials = sshCandidateCredentials
+                    )
+                    verifiedSshMode == "SSL_PAYLOAD" -> SshTunnelClient(
+                        protectSocket = ::protectSocketSafely,
+                        host = cleanHost,
+                        port = verifiedSshPort,
+                        username = sshUser,
+                        candidatePasswords = sshCandidatePasswords,
+                        customSocketFactory = VpsReachabilityTester.createSslPayloadSshSocketFactory(
+                            profile = profile,
+                            protectSocket = ::protectSocketSafely,
+                            timeoutMs = 5500,
+                            onLog = VpnStateHolder::appendLog,
+                            overridePort = verifiedSshPort
                         ),
                         candidateCredentials = sshCandidateCredentials
                     )
                     else -> SshTunnelClient(
                         protectSocket = ::protectSocketSafely,
                         host = cleanHost,
-                        port = targetPort,
+                        port = verifiedSshPort.takeIf { it > 0 } ?: targetPort,
                         username = sshUser,
                         candidatePasswords = sshCandidatePasswords,
                         candidateCredentials = sshCandidateCredentials

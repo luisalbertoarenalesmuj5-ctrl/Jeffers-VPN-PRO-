@@ -125,7 +125,7 @@ class SshTunnelClient(
         onLog("SSH", "SSH → $usersSummary@$host:$port (${credentialsToTry.size} credencial(es))", LogLevel.INFO)
 
         var lastError: Exception? = null
-        credentialsToTry.forEachIndexed { index, cred ->
+        for ((index, cred) in credentialsToTry.withIndex()) {
             var candidateSession: Session? = null
             try {
                 JSch.setLogger(object : com.jcraft.jsch.Logger {
@@ -195,6 +195,12 @@ class SshTunnelClient(
                 try {
                     candidateSession?.disconnect()
                 } catch (_: Exception) {
+                }
+                val isLikelyAuthOrSessionFailure = detail.contains("Auth", ignoreCase = true) ||
+                    detail.contains("authentication", ignoreCase = true) ||
+                    detail.contains("USERAUTH", ignoreCase = true)
+                if (!isLikelyAuthOrSessionFailure && index + 1 < credentialsToTry.size) {
+                    break
                 }
             }
         }

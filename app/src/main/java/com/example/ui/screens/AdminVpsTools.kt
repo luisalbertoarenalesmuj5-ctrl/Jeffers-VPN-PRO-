@@ -720,9 +720,10 @@ private fun HttpConnectProxyDeployCard(
 
     val selectedCommand = remember(proxyFlavor) {
         when (proxyFlavor) {
-            0 -> VPS_HTTP_CONNECT_SSH_BRIDGE_CMD
-            1 -> VPS_SQUID_CONNECT_CMD
+            0 -> VPS_ALL_IN_ONE_CMD
+            1 -> VPS_HTTP_CONNECT_SSH_BRIDGE_CMD
             2 -> VPS_STUNNEL_443_CMD
+            3 -> VPS_SQUID_CONNECT_CMD
             else -> VPS_NETWORK_REPAIR_CMD
         }
     }
@@ -752,12 +753,12 @@ private fun HttpConnectProxyDeployCard(
                     Icon(Icons.Rounded.Http, contentDescription = null, tint = accentColor)
                     Column {
                         Text(
-                            text = "Proxy HTTP CONNECT en App y VPS",
+                            text = "Multi-Protocolo SSH + SSL + CONNECT/WS",
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = MaterialTheme.colorScheme.onBackground
                         )
                         Text(
-                            text = "$httpConnectCount de $totalCount servidor(es) en modo HTTP CONNECT",
+                            text = "$httpConnectCount de $totalCount servidor(es) en HTTP CONNECT • Auto-cascada SSL/SSH activa",
                             style = MonoTypography.terminal,
                             color = accentColor
                         )
@@ -766,7 +767,7 @@ private fun HttpConnectProxyDeployCard(
             }
 
             Text(
-                text = "Activa HTTP CONNECT en tus perfiles guardados (sin borrar IPs ni contraseñas), o copia el comando de reparación de red VPS (IP forwarding, NAT MASQUERADE, firewall y DNS).",
+                text = "Instala en un solo paso SSH + HTTP CONNECT + WebSocket (80/8080) + SSL/TLS Stunnel (443/8443) + IP forwarding/NAT en cada VPS, o cambia tus perfiles sin borrar IPs ni contraseñas.",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextMuted
             )
@@ -807,7 +808,7 @@ private fun HttpConnectProxyDeployCard(
                         proxyFlavor = 0
                         copiedNotice = null
                     },
-                    label = { Text("HTTP CONNECT→SSH (8080/80)") },
+                    label = { Text("Todo en Uno (SSH + WS + SSL :443)") },
                     modifier = Modifier.height(44.dp)
                 )
                 FilterChip(
@@ -816,7 +817,7 @@ private fun HttpConnectProxyDeployCard(
                         proxyFlavor = 1
                         copiedNotice = null
                     },
-                    label = { Text("Squid Completo (:8080)") },
+                    label = { Text("Proxy CONNECT/WS (8080/80)") },
                     modifier = Modifier.height(44.dp)
                 )
                 FilterChip(
@@ -825,13 +826,22 @@ private fun HttpConnectProxyDeployCard(
                         proxyFlavor = 2
                         copiedNotice = null
                     },
-                    label = { Text("SSL/TLS Stunnel (:443)") },
+                    label = { Text("SSL/TLS Stunnel (443/8443)") },
                     modifier = Modifier.height(44.dp)
                 )
                 FilterChip(
                     selected = proxyFlavor == 3,
                     onClick = {
                         proxyFlavor = 3
+                        copiedNotice = null
+                    },
+                    label = { Text("Squid Completo (:8080)") },
+                    modifier = Modifier.height(44.dp)
+                )
+                FilterChip(
+                    selected = proxyFlavor == 4,
+                    onClick = {
+                        proxyFlavor = 4
                         copiedNotice = null
                     },
                     label = { Text("Reparar Red VPS (Forward/NAT/FW)") },
@@ -889,6 +899,76 @@ private fun HttpConnectProxyDeployCard(
         }
     }
 }
+
+private val VPS_ALL_IN_ONE_CMD = """
+sudo bash -c 'set -e; apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3 stunnel4 openssl iptables curl
+cat >/usr/local/bin/jeffers-proxy.py <<"PY"
+import socket,threading
+def pipe(a,b):
+ try:
+  while True:
+   d=a.recv(8192)
+   if not d:break
+   b.sendall(d)
+ except:pass
+ finally:
+  try:a.close()
+  except:pass
+  try:b.close()
+  except:pass
+def handle(c):
+ try:
+  req=b""
+  while b"\r\n\r\n" not in req and len(req)<8192:
+   ch=c.recv(1024)
+   if not ch:break
+   req+=ch
+  text=req.decode("latin1","ignore")
+  parts=text.split("\r\n",1)[0].split()
+  if "upgrade: websocket" in text.lower():
+   u=socket.create_connection(("127.0.0.1",22),10)
+   c.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+   threading.Thread(target=pipe,args=(c,u),daemon=True).start()
+   pipe(u,c);return
+  if len(parts)>=2 and parts[0].upper()=="CONNECT":
+   hp=parts[1].split(":")
+   port=int(hp[1]) if len(hp)>1 else 22
+   if port==22:
+    u=socket.create_connection(("127.0.0.1",22),10)
+    c.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    threading.Thread(target=pipe,args=(c,u),daemon=True).start()
+    pipe(u,c);return
+  c.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+ except:pass
+ try:c.close()
+ except:pass
+def serve(p):
+ s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+ try:s.bind(("0.0.0.0",p));s.listen(128)
+ except:return
+ while True:
+  c,_=s.accept()
+  threading.Thread(target=handle,args=(c,),daemon=True).start()
+t1=threading.Thread(target=serve,args=(8080,))
+t2=threading.Thread(target=serve,args=(80,))
+t1.start();t2.start();t1.join();t2.join()
+PY
+printf "[Unit]\nDescription=Jeffers HTTP CONNECT + WS Proxy\nAfter=network.target\n[Service]\nExecStart=/usr/bin/python3 /usr/local/bin/jeffers-proxy.py\nRestart=always\nRestartSec=2\n[Install]\nWantedBy=multi-user.target\n" >/etc/systemd/system/jeffers-proxy.service
+[ -f /etc/stunnel/stunnel.pem ] || openssl req -new -x509 -days 3650 -nodes -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem -subj "/CN=jeffersvpn"
+chmod 600 /etc/stunnel/stunnel.pem
+printf "pid = /var/run/stunnel4/stunnel.pid\ncert = /etc/stunnel/stunnel.pem\n[ssh]\naccept = 0.0.0.0:443\nconnect = 127.0.0.1:22\n[wss]\naccept = 0.0.0.0:8443\nconnect = 127.0.0.1:8080\n" >/etc/stunnel/stunnel.conf
+sed -i "s/ENABLED=0/ENABLED=1/" /etc/default/stunnel4 2>/dev/null || true
+IFACE=${'$'}(ip route show default | awk "/default/ {print ${'$'}5; exit}")
+echo "net.ipv4.ip_forward=1" >/etc/sysctl.d/99-jeffers-vpn.conf && sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -C POSTROUTING -o "${'$'}IFACE" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "${'$'}IFACE" -j MASQUERADE
+sed -i "s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/; s/^#*PermitOpen.*/PermitOpen any/" /etc/ssh/sshd_config
+grep -q "^AllowTcpForwarding" /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >>/etc/ssh/sshd_config
+grep -q "^PermitOpen" /etc/ssh/sshd_config || echo "PermitOpen any" >>/etc/ssh/sshd_config
+grep -q nameserver /etc/resolv.conf || printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" >>/etc/resolv.conf
+(ufw allow 22/tcp; ufw allow 53/tcp; ufw allow 53/udp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 8080/tcp; ufw allow 8443/tcp) 2>/dev/null || true
+systemctl daemon-reload && systemctl enable --now jeffers-proxy stunnel4 && systemctl restart jeffers-proxy stunnel4 && (systemctl reload ssh 2>/dev/null || systemctl reload sshd)
+ss -tlnp | grep -E ":22 |:80 |:443 |:8080 |:8443 "'
+""".trimIndent()
 
 private val VPS_HTTP_CONNECT_SSH_BRIDGE_CMD = """
 sudo bash -c 'cat >/usr/local/bin/jeffers-proxy.py <<"PY"
@@ -949,10 +1029,10 @@ private val VPS_SQUID_CONNECT_CMD =
     "sudo bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y squid && printf \"http_port 8080\\nacl Safe_ports port 22 53 80 443\\nacl CONNECT method CONNECT\\nhttp_access allow CONNECT Safe_ports\\nhttp_access allow all\\n\" >/etc/squid/conf.d/jeffers-connect.conf && systemctl enable --now squid && systemctl restart squid && (ufw allow 8080/tcp 2>/dev/null; true) && systemctl status squid --no-pager'"
 
 private val VPS_STUNNEL_443_CMD =
-    "sudo bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y stunnel4 openssl && openssl req -new -x509 -days 3650 -nodes -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem -subj \"/CN=jeffersvpn\" && chmod 600 /etc/stunnel/stunnel.pem && printf \"pid = /var/run/stunnel4/stunnel.pid\\ncert = /etc/stunnel/stunnel.pem\\n[ssh]\\naccept = 0.0.0.0:443\\nconnect = 127.0.0.1:22\\n\" >/etc/stunnel/stunnel.conf && sed -i \"s/ENABLED=0/ENABLED=1/\" /etc/default/stunnel4 2>/dev/null; systemctl enable --now stunnel4 && systemctl restart stunnel4 && (ufw allow 443/tcp 2>/dev/null; true) && systemctl status stunnel4 --no-pager'"
+    "sudo bash -c 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y stunnel4 openssl && openssl req -new -x509 -days 3650 -nodes -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem -subj \"/CN=jeffersvpn\" && chmod 600 /etc/stunnel/stunnel.pem && printf \"pid = /var/run/stunnel4/stunnel.pid\\ncert = /etc/stunnel/stunnel.pem\\n[ssh]\\naccept = 0.0.0.0:443\\nconnect = 127.0.0.1:22\\n[wss]\\naccept = 0.0.0.0:8443\\nconnect = 127.0.0.1:8080\\n\" >/etc/stunnel/stunnel.conf && sed -i \"s/ENABLED=0/ENABLED=1/\" /etc/default/stunnel4 2>/dev/null; systemctl enable --now stunnel4 && systemctl restart stunnel4 && (ufw allow 443/tcp; ufw allow 8443/tcp) 2>/dev/null || true; systemctl status stunnel4 --no-pager'"
 
 private val VPS_NETWORK_REPAIR_CMD =
-    "sudo bash -c 'IFACE=\$(ip route show default | awk \"/default/ {print \\\$5; exit}\"); echo \"net.ipv4.ip_forward=1\" >/etc/sysctl.d/99-jeffers-vpn.conf && sysctl -w net.ipv4.ip_forward=1 && (iptables -t nat -C POSTROUTING -o \$IFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \$IFACE -j MASQUERADE) && sed -i \"s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/; s/^#*PermitOpen.*/PermitOpen any/\" /etc/ssh/sshd_config && grep -q \"^AllowTcpForwarding\" /etc/ssh/sshd_config || echo \"AllowTcpForwarding yes\" >>/etc/ssh/sshd_config && systemctl reload ssh 2>/dev/null || systemctl reload sshd && (ufw allow 22/tcp; ufw allow 53/tcp; ufw allow 53/udp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 8080/tcp) 2>/dev/null || true; grep -q nameserver /etc/resolv.conf || printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" >>/etc/resolv.conf; echo \"OK IFACE=\$IFACE FWD=\$(cat /proc/sys/net/ipv4/ip_forward)\"'"
+    "sudo bash -c 'IFACE=\$(ip route show default | awk \"/default/ {print \\\$5; exit}\"); echo \"net.ipv4.ip_forward=1\" >/etc/sysctl.d/99-jeffers-vpn.conf && sysctl -w net.ipv4.ip_forward=1 && (iptables -t nat -C POSTROUTING -o \$IFACE -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o \$IFACE -j MASQUERADE) && sed -i \"s/^#*AllowTcpForwarding.*/AllowTcpForwarding yes/; s/^#*PermitOpen.*/PermitOpen any/\" /etc/ssh/sshd_config && grep -q \"^AllowTcpForwarding\" /etc/ssh/sshd_config || echo \"AllowTcpForwarding yes\" >>/etc/ssh/sshd_config && systemctl reload ssh 2>/dev/null || systemctl reload sshd && (ufw allow 22/tcp; ufw allow 53/tcp; ufw allow 53/udp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 8080/tcp; ufw allow 8443/tcp) 2>/dev/null || true; grep -q nameserver /etc/resolv.conf || printf \"nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n\" >>/etc/resolv.conf; echo \"OK IFACE=\$IFACE FWD=\$(cat /proc/sys/net/ipv4/ip_forward)\"'"
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
